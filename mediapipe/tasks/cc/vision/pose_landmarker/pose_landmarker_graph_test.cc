@@ -80,8 +80,14 @@ constexpr char kImageTag[] = "IMAGE";
 constexpr char kImageName[] = "image";
 constexpr char kNormRectTag[] = "NORM_RECT";
 constexpr char kNormRectName[] = "norm_rect";
+constexpr char kExternalPoseRectTag[] = "EXTERNAL_POSE_RECT";
+constexpr char kExternalPoseRectName[] = "external_pose_rect";
+constexpr char kUseExternalPoseRectTag[] = "USE_EXTERNAL_POSE_RECT";
+constexpr char kUseExternalPoseRectName[] = "use_external_pose_rect";
 constexpr char kNormLandmarksTag[] = "NORM_LANDMARKS";
 constexpr char kNormLandmarksName[] = "norm_landmarks";
+constexpr char kPoseRectsNextFrameTag[] = "POSE_RECTS_NEXT_FRAME";
+constexpr char kPoseRectsNextFrameName[] = "pose_rects_next_frame";
 constexpr char kSegmentationMaskTag[] = "SEGMENTATION_MASK";
 constexpr char kSegmentationMaskName[] = "segmentation_mask";
 constexpr char kTaskName[] = "pose_landmarker_test";
@@ -115,7 +121,7 @@ struct PoseLandmarkerGraphTestParams {
 
 // Helper function to create a PoseLandmarkerGraph TaskRunner.
 absl::StatusOr<std::unique_ptr<TaskRunner>> CreatePoseLandmarkerGraphTaskRunner(
-    absl::string_view model_name) {
+    absl::string_view model_name, bool enable_external_pose_rect = false) {
   Graph graph;
 
   auto& pose_landmarker = graph.AddNode(
@@ -132,9 +138,21 @@ absl::StatusOr<std::unique_ptr<TaskRunner>> CreatePoseLandmarkerGraphTaskRunner(
       pose_landmarker.In(kImageTag);
   graph[Input<NormalizedRect>(kNormRectTag)].SetName(kNormRectName) >>
       pose_landmarker.In(kNormRectTag);
+  if (enable_external_pose_rect) {
+    graph[Input<NormalizedRect>(kExternalPoseRectTag)]
+            .SetName(kExternalPoseRectName) >>
+        pose_landmarker.In(kExternalPoseRectTag);
+    graph[Input<bool>(kUseExternalPoseRectTag)]
+            .SetName(kUseExternalPoseRectName) >>
+        pose_landmarker.In(kUseExternalPoseRectTag);
+  }
 
   pose_landmarker.Out(kNormLandmarksTag).SetName(kNormLandmarksName) >>
       graph[Output<std::vector<NormalizedLandmarkList>>(kNormLandmarksTag)];
+
+  pose_landmarker.Out(kPoseRectsNextFrameTag)
+          .SetName(kPoseRectsNextFrameName) >>
+      graph[Output<std::vector<NormalizedRect>>(kPoseRectsNextFrameTag)];
 
   pose_landmarker.Out(kSegmentationMaskTag).SetName(kSegmentationMaskName) >>
       graph[Output<std::vector<Image>>(kSegmentationMaskTag)];
@@ -246,6 +264,51 @@ TEST_P(PoseLandmarkerGraphTest, Succeeds) {
   MP_ASSERT_OK_AND_ASSIGN(auto output_path,
                           SavePngTestOutput(segmentation_mask_image_frame,
                                             "segmentation_mask_output"));
+}
+
+TEST(PoseLandmarkerGraphExternalRectTest,
+     ExternalPoseRectOverridesInternalTrackingRect) {
+  MP_ASSERT_OK_AND_ASSIGN(
+      auto task_runner,
+      CreatePoseLandmarkerGraphTaskRunner(kPoseLandmarkerModelBundleName,
+                                          /*enable_external_pose_rect=*/true));
+
+  MP_ASSERT_OK_AND_ASSIGN(
+      Image first_image,
+      DecodeImageFromFile(JoinPath("./", kTestDataDirectory, kPoseImageName)));
+  auto first_output_packets = task_runner->Process(
+      {{kImageName, MakePacket<Image>(std::move(first_image))},
+       {kNormRectName,
+        MakePacket<NormalizedRect>(
+            MakeNormRect(0.5f, 0.5f, 1.0f, 1.0f, 0.0f))},
+       {kExternalPoseRectName,
+        MakePacket<NormalizedRect>(
+            MakeNormRect(0.5f, 0.5f, 1.0f, 1.0f, 0.0f))},
+       {kUseExternalPoseRectName, MakePacket<bool>(false)}});
+  MP_ASSERT_OK(first_output_packets);
+  ASSERT_FALSE((*first_output_packets)[kNormLandmarksName].IsEmpty());
+  ASSERT_EQ((*first_output_packets)[kPoseRectsNextFrameName]
+                .Get<std::vector<NormalizedRect>>()
+                .size(),
+            1);
+
+  MP_ASSERT_OK_AND_ASSIGN(
+      Image second_image,
+      DecodeImageFromFile(JoinPath("./", kTestDataDirectory, kPoseImageName)));
+  auto second_output_packets = task_runner->Process(
+      {{kImageName, MakePacket<Image>(std::move(second_image))},
+       {kNormRectName,
+        MakePacket<NormalizedRect>(
+            MakeNormRect(0.5f, 0.5f, 1.0f, 1.0f, 0.0f))},
+       // This rectangle is entirely outside the source image. If the internal
+       // tracking rectangle were still selected, the pose would remain found.
+       {kExternalPoseRectName,
+        MakePacket<NormalizedRect>(
+            MakeNormRect(2.0f, 2.0f, 0.1f, 0.1f, 0.0f))},
+       {kUseExternalPoseRectName, MakePacket<bool>(true)}});
+  MP_ASSERT_OK(second_output_packets);
+  EXPECT_TRUE((*second_output_packets)[kNormLandmarksName].IsEmpty());
+  EXPECT_TRUE((*second_output_packets)[kPoseRectsNextFrameName].IsEmpty());
 }
 
 INSTANTIATE_TEST_SUITE_P(

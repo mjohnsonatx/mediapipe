@@ -29,6 +29,7 @@ import com.google.mediapipe.framework.image.BitmapImageBuilder;
 import com.google.mediapipe.framework.image.MPImage;
 import com.google.mediapipe.tasks.components.containers.Landmark;
 import com.google.mediapipe.tasks.components.containers.NormalizedLandmark;
+import com.google.mediapipe.tasks.components.containers.NormalizedRect;
 import com.google.mediapipe.tasks.components.containers.proto.LandmarksDetectionResultProto.LandmarksDetectionResult;
 import com.google.mediapipe.tasks.core.BaseOptions;
 import com.google.mediapipe.tasks.vision.core.ImageProcessingOptions;
@@ -262,11 +263,65 @@ public class PoseLandmarkerTest {
     PoseLandmarker poseLandmarker =
         PoseLandmarker.createFromOptions(ApplicationProvider.getApplicationContext(), options);
     PoseLandmarkerResult expectedResult = getExpectedPoseLandmarkerResult(POSE_LANDMARKS);
+    NormalizedRect externalPoseRect = null;
     for (int i = 0; i < 3; i++) {
       PoseLandmarkerResult actualResult =
-          poseLandmarker.detectForVideo(getImageFromAsset(POSE_IMAGE), /* timestampsMs= */ i);
+          externalPoseRect == null
+              ? poseLandmarker.detectForVideo(
+                  getImageFromAsset(POSE_IMAGE), /* timestampsMs= */ i)
+              : poseLandmarker.detectForVideo(
+                  getImageFromAsset(POSE_IMAGE), externalPoseRect, /* timestampsMs= */ i);
       assertActualResultApproximatelyEqualsToExpectedResult(actualResult, expectedResult);
+      assertThat(actualResult.poseRectsNextFrame()).hasSize(1);
+      externalPoseRect = actualResult.poseRectsNextFrame().get(0);
     }
+  }
+
+  @Test
+  public void recognize_successAfterTrackingReset() throws Exception {
+    PoseLandmarkerOptions options =
+        PoseLandmarkerOptions.builder()
+            .setBaseOptions(
+                BaseOptions.builder().setModelAssetPath(POSE_LANDMARKER_BUNDLE_ASSET_FILE).build())
+            .setRunningMode(RunningMode.VIDEO)
+            .build();
+    try (PoseLandmarker poseLandmarker =
+        PoseLandmarker.createFromOptions(ApplicationProvider.getApplicationContext(), options)) {
+      PoseLandmarkerResult expectedResult = getExpectedPoseLandmarkerResult(POSE_LANDMARKS);
+      PoseLandmarkerResult beforeReset =
+          poseLandmarker.detectForVideo(getImageFromAsset(POSE_IMAGE), /* timestampsMs= */ 10_000);
+
+      poseLandmarker.resetTracking();
+      PoseLandmarkerResult afterReset =
+          poseLandmarker.detectForVideo(getImageFromAsset(POSE_IMAGE), /* timestampsMs= */ 10_001);
+
+      assertActualResultApproximatelyEqualsToExpectedResult(beforeReset, expectedResult);
+      assertActualResultApproximatelyEqualsToExpectedResult(afterReset, expectedResult);
+      assertThat(afterReset.poseRectsNextFrame()).hasSize(1);
+    }
+  }
+
+  @Test
+  public void recognize_failsWithInvalidExternalPoseRect() throws Exception {
+    PoseLandmarkerOptions options =
+        PoseLandmarkerOptions.builder()
+            .setBaseOptions(
+                BaseOptions.builder().setModelAssetPath(POSE_LANDMARKER_BUNDLE_ASSET_FILE).build())
+            .setRunningMode(RunningMode.VIDEO)
+            .build();
+    PoseLandmarker poseLandmarker =
+        PoseLandmarker.createFromOptions(ApplicationProvider.getApplicationContext(), options);
+
+    IllegalArgumentException exception =
+        assertThrows(
+            IllegalArgumentException.class,
+            () ->
+                poseLandmarker.detectForVideo(
+                    getImageFromAsset(POSE_IMAGE),
+                    NormalizedRect.create(0.5f, 0.5f, 0.0f, 1.0f, 0.0f),
+                    /* timestampsMs= */ 0));
+
+    assertThat(exception).hasMessageThat().contains("width and height must be positive");
   }
 
   @Test

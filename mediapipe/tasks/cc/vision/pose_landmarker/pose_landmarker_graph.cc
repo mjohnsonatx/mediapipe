@@ -13,6 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <optional>
 #include <vector>
 
 #include "absl/status/status.h"
@@ -22,6 +23,7 @@ limitations under the License.
 #include "mediapipe/calculators/util/collection_has_min_size_calculator.pb.h"
 #include "mediapipe/framework/api2/builder.h"
 #include "mediapipe/framework/api2/port.h"
+#include "mediapipe/framework/api2/stream/merge.h"
 #include "mediapipe/framework/formats/detection.pb.h"
 #include "mediapipe/framework/formats/image.h"
 #include "mediapipe/framework/formats/landmark.pb.h"
@@ -49,8 +51,10 @@ using ::mediapipe::NormalizedRect;
 using ::mediapipe::api2::Input;
 using ::mediapipe::api2::Output;
 using ::mediapipe::api2::builder::Graph;
+using ::mediapipe::api2::builder::Merge;
 using ::mediapipe::api2::builder::SidePacket;
 using ::mediapipe::api2::builder::Source;
+using ::mediapipe::tasks::components::utils::AllowIf;
 using ::mediapipe::tasks::components::utils::DisallowIf;
 using ::mediapipe::tasks::core::ModelAssetBundleResources;
 using ::mediapipe::tasks::metadata::SetExternalFile;
@@ -63,6 +67,9 @@ using ::mediapipe::tasks::vision::pose_landmarker::proto::
 
 constexpr char kImageTag[] = "IMAGE";
 constexpr char kNormRectTag[] = "NORM_RECT";
+constexpr char kExternalPoseRectTag[] = "EXTERNAL_POSE_RECT";
+constexpr char kUseExternalPoseRectTag[] = "USE_EXTERNAL_POSE_RECT";
+constexpr char kResetTrackingTag[] = "RESET_TRACKING";
 constexpr char kNormLandmarksTag[] = "NORM_LANDMARKS";
 constexpr char kWorldLandmarksTag[] = "WORLD_LANDMARKS";
 constexpr char kAuxiliaryLandmarksTag[] = "AUXILIARY_LANDMARKS";
@@ -163,6 +170,16 @@ absl::Status SetSubTaskBaseOptions(const ModelAssetBundleResources& resources,
 //     Describes image rotation and region of image to perform landmarks
 //     detection on. If not provided, whole image is used for pose landmarks
 //     detection.
+//   EXTERNAL_POSE_RECT - NormalizedRect @Optional
+//     A pose region of interest to use directly for landmark detection instead
+//     of the region retained by the internal stream-mode tracker. This input
+//     must be accompanied by USE_EXTERNAL_POSE_RECT.
+//   USE_EXTERNAL_POSE_RECT - bool @Optional
+//     Whether EXTERNAL_POSE_RECT should override the internally tracked pose
+//     rectangle for this timestamp.
+//   RESET_TRACKING - bool @Optional
+//     When true, ignores the internally tracked pose rectangle for this
+//     timestamp so pose detection runs again.
 //
 //
 // Outputs:
@@ -191,6 +208,9 @@ absl::Status SetSubTaskBaseOptions(const ModelAssetBundleResources& resources,
 //   calculator: "mediapipe.tasks.vision.pose_landmarker.PoseLandmarkerGraph"
 //   input_stream: "IMAGE:image_in"
 //   input_stream: "NORM_RECT:norm_rect"
+//   input_stream: "EXTERNAL_POSE_RECT:external_pose_rect"
+//   input_stream: "USE_EXTERNAL_POSE_RECT:use_external_pose_rect"
+//   input_stream: "RESET_TRACKING:reset_tracking"
 //   output_stream: "NORM_LANDMARKS:pose_landmarks"
 //   output_stream: "WORLD_LANDMARKS:world_landmarks"
 //   output_stream: "AUXILIARY_LANDMARKS:auxiliary_landmarks"
@@ -237,12 +257,34 @@ class PoseLandmarkerGraph : public core::ModelTaskGraph {
           !sc->Service(::mediapipe::tasks::core::kModelResourcesCacheService)
                .IsAvailable()));
     }
+    const bool has_external_pose_rect =
+        HasInput(sc->OriginalNode(), kExternalPoseRectTag);
+    const bool has_use_external_pose_rect =
+        HasInput(sc->OriginalNode(), kUseExternalPoseRectTag);
+    if (has_external_pose_rect != has_use_external_pose_rect) {
+      return absl::InvalidArgumentError(
+          "EXTERNAL_POSE_RECT and USE_EXTERNAL_POSE_RECT must either both be "
+          "connected or both be omitted.");
+    }
+    std::optional<Source<NormalizedRect>> external_pose_rect_in;
+    std::optional<Source<bool>> use_external_pose_rect_in;
+    if (has_external_pose_rect) {
+      external_pose_rect_in =
+          graph.In(kExternalPoseRectTag).Cast<NormalizedRect>();
+      use_external_pose_rect_in =
+          graph.In(kUseExternalPoseRectTag).Cast<bool>();
+    }
+    std::optional<Source<bool>> reset_tracking_in;
+    if (HasInput(sc->OriginalNode(), kResetTrackingTag)) {
+      reset_tracking_in = graph.In(kResetTrackingTag).Cast<bool>();
+    }
     ABSL_ASSIGN_OR_RETURN(
         auto outs, BuildPoseLandmarkerGraph(
                        *sc->MutableOptions<PoseLandmarkerGraphOptions>(),
                        graph[Input<Image>(kImageTag)],
                        graph[Input<NormalizedRect>::Optional(kNormRectTag)],
-                       graph, output_segmentation_masks));
+                       external_pose_rect_in, use_external_pose_rect_in,
+                       reset_tracking_in, graph, output_segmentation_masks));
     outs.landmark_lists >>
         graph[Output<std::vector<NormalizedLandmarkList>>(kNormLandmarksTag)];
     outs.world_landmark_lists >>
@@ -274,7 +316,10 @@ class PoseLandmarkerGraph : public core::ModelTaskGraph {
   // graph: the mediapipe graph instance to be updated.
   absl::StatusOr<PoseLandmarkerOutputs> BuildPoseLandmarkerGraph(
       PoseLandmarkerGraphOptions& tasks_options, Source<Image> image_in,
-      Source<NormalizedRect> norm_rect_in, Graph& graph,
+      Source<NormalizedRect> norm_rect_in,
+      std::optional<Source<NormalizedRect>> external_pose_rect_in,
+      std::optional<Source<bool>> use_external_pose_rect_in,
+      std::optional<Source<bool>> reset_tracking_in, Graph& graph,
       bool output_segmentation_masks) {
     const int max_num_poses =
         tasks_options.pose_detector_graph_options().num_poses();
@@ -339,9 +384,35 @@ class PoseLandmarkerGraph : public core::ModelTaskGraph {
       auto prev_pose_rects_from_landmarks =
           previous_loopback[Output<std::vector<NormalizedRect>>(kPrevLoopTag)];
 
+      // A reset is consumed with the next video frame. Dropping the loopback
+      // packet makes has_enough_poses empty/false, which opens the detector
+      // gates and prevents the stale rectangle from entering association.
+      if (reset_tracking_in) {
+        prev_pose_rects_from_landmarks = DisallowIf(
+            prev_pose_rects_from_landmarks, *reset_tracking_in, graph);
+      }
+
+      // When supplied for this timestamp, an external pose rectangle takes
+      // priority over the rectangle retained by this graph instance. The
+      // singular external rectangle is vectorized to match the multi-pose
+      // landmark detector interface.
+      auto pose_rects_for_tracking = prev_pose_rects_from_landmarks;
+      if (external_pose_rect_in && use_external_pose_rect_in) {
+        auto& concatenate_external_pose_rect =
+            graph.AddNode("ConcatenateNormalizedRectVectorCalculator");
+        *external_pose_rect_in >> concatenate_external_pose_rect.In("");
+        Source<std::vector<NormalizedRect>> external_pose_rects =
+            concatenate_external_pose_rect.Out("")
+                .Cast<std::vector<NormalizedRect>>();
+        external_pose_rects = AllowIf(external_pose_rects,
+                                      *use_external_pose_rect_in, graph);
+        pose_rects_for_tracking =
+            Merge(external_pose_rects, prev_pose_rects_from_landmarks, graph);
+      }
+
       auto& min_size_node =
           graph.AddNode("NormalizedRectVectorHasMinSizeCalculator");
-      prev_pose_rects_from_landmarks >> min_size_node.In(kIterableTag);
+      pose_rects_for_tracking >> min_size_node.In(kIterableTag);
       min_size_node.GetOptions<CollectionHasMinSizeCalculatorOptions>()
           .set_min_size(max_num_poses);
       auto has_enough_poses = min_size_node.Out("").Cast<bool>();
@@ -360,7 +431,7 @@ class PoseLandmarkerGraph : public core::ModelTaskGraph {
       pose_association.GetOptions<mediapipe::AssociationCalculatorOptions>()
           .set_min_similarity_threshold(
               tasks_options.min_tracking_confidence());
-      prev_pose_rects_from_landmarks >>
+      pose_rects_for_tracking >>
           pose_association[Input<std::vector<NormalizedRect>>::Multiple("")][0];
       expanded_pose_rects_from_pose_detector >>
           pose_association[Input<std::vector<NormalizedRect>>::Multiple("")][1];
@@ -369,6 +440,12 @@ class PoseLandmarkerGraph : public core::ModelTaskGraph {
       // Back edge.
       pose_rects_for_next_frame >> previous_loopback.In(kLoopTag);
     } else {
+      if (external_pose_rect_in || use_external_pose_rect_in ||
+          reset_tracking_in) {
+        return absl::InvalidArgumentError(
+            "External pose rectangles and tracking reset are only supported "
+            "in stream mode.");
+      }
       // While not in stream mode, the input images are not guaranteed to be in
       // series, and we don't want to enable the tracking and rect associations
       // between input images. Always use the pose detector graph.

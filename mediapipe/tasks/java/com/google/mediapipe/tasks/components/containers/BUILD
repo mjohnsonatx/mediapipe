@@ -101,6 +101,15 @@ android_library(
 )
 
 android_library(
+    name = "normalized_rect",
+    srcs = ["NormalizedRect.java"],
+    deps = [
+        "//mediapipe/framework/formats:rect_java_proto_lite",
+        "//third_party:autovalue",
+    ],
+)
+
+android_library(
     name = "normalizedkeypoint",
     srcs = ["NormalizedKeypoint.java"],
     deps = [

@@ -20,6 +20,7 @@
 #include "mediapipe/framework/formats/classification.pb.h"
 #include "mediapipe/framework/formats/image.h"
 #include "mediapipe/framework/formats/landmark.pb.h"
+#include "mediapipe/framework/formats/rect.pb.h"
 #include "mediapipe/framework/formats/tensor.h"
 #include "mediapipe/util/render_data.pb.h"
 #include "tflite/interpreter.h"
@@ -85,6 +86,10 @@ MEDIAPIPE_REGISTER_NODE(ConcatenateLandmarkListVectorCalculator);
 typedef ConcatenateVectorCalculator<::mediapipe::NormalizedLandmarkList>
     ConcatenateNormalizedLandmarkListVectorCalculator;
 MEDIAPIPE_REGISTER_NODE(ConcatenateNormalizedLandmarkListVectorCalculator);
+
+typedef ConcatenateVectorCalculator<::mediapipe::NormalizedRect>
+    ConcatenateNormalizedRectVectorCalculator;
+MEDIAPIPE_REGISTER_NODE(ConcatenateNormalizedRectVectorCalculator);
 
 // For backwards compatibility, keep the version with the typo.
 using ConcatenateLandmarListVectorCalculator =

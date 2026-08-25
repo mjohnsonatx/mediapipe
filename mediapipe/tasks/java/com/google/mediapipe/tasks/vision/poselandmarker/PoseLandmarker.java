@@ -19,6 +19,7 @@ import android.os.ParcelFileDescriptor;
 import com.google.auto.value.AutoValue;
 import com.google.mediapipe.formats.proto.LandmarkProto.LandmarkList;
 import com.google.mediapipe.formats.proto.LandmarkProto.NormalizedLandmarkList;
+import com.google.mediapipe.formats.proto.RectProto;
 import com.google.mediapipe.proto.CalculatorOptionsProto.CalculatorOptions;
 import com.google.mediapipe.framework.AndroidPacketGetter;
 import com.google.mediapipe.framework.MediaPipeException;
@@ -28,6 +29,7 @@ import com.google.mediapipe.framework.image.BitmapImageBuilder;
 import com.google.mediapipe.framework.image.ByteBufferImageBuilder;
 import com.google.mediapipe.framework.image.MPImage;
 import com.google.mediapipe.tasks.components.containers.Connection;
+import com.google.mediapipe.tasks.components.containers.NormalizedRect;
 import com.google.mediapipe.tasks.core.BaseOptions;
 import com.google.mediapipe.tasks.core.ErrorListener;
 import com.google.mediapipe.tasks.core.OutputHandler;
@@ -48,9 +50,12 @@ import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Performs pose landmarks detection on images.
@@ -73,15 +78,22 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
   private static final String TAG = PoseLandmarker.class.getSimpleName();
   private static final String IMAGE_IN_STREAM_NAME = "image_in";
   private static final String NORM_RECT_IN_STREAM_NAME = "norm_rect_in";
+  private static final String EXTERNAL_POSE_RECT_IN_STREAM_NAME = "external_pose_rect_in";
+  private static final String USE_EXTERNAL_POSE_RECT_IN_STREAM_NAME =
+      "use_external_pose_rect_in";
+  private static final String RESET_TRACKING_IN_STREAM_NAME = "reset_tracking_in";
+
+  private final AtomicBoolean resetTrackingPending = new AtomicBoolean(false);
 
   @SuppressWarnings("ConstantCaseForConstants")
-  private static final List<String> INPUT_STREAMS =
+  private static final List<String> BASE_INPUT_STREAMS =
       Collections.unmodifiableList(
           Arrays.asList("IMAGE:" + IMAGE_IN_STREAM_NAME, "NORM_RECT:" + NORM_RECT_IN_STREAM_NAME));
 
   private static final int LANDMARKS_OUT_STREAM_INDEX = 0;
   private static final int WORLD_LANDMARKS_OUT_STREAM_INDEX = 1;
   private static final int IMAGE_OUT_STREAM_INDEX = 2;
+  private static final int POSE_RECTS_NEXT_FRAME_OUT_STREAM_INDEX = 3;
   private static int segmentationMasksOutStreamIndex = -1;
   private static final String TASK_GRAPH_NAME =
       "mediapipe.tasks.vision.pose_landmarker.PoseLandmarkerGraph";
@@ -147,10 +159,18 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
    */
   public static PoseLandmarker createFromOptions(
       Context context, PoseLandmarkerOptions landmarkerOptions) {
+    List<String> inputStreams = new ArrayList<>(BASE_INPUT_STREAMS);
+    if (landmarkerOptions.runningMode() == RunningMode.VIDEO) {
+      inputStreams.add("EXTERNAL_POSE_RECT:" + EXTERNAL_POSE_RECT_IN_STREAM_NAME);
+      inputStreams.add(
+          "USE_EXTERNAL_POSE_RECT:" + USE_EXTERNAL_POSE_RECT_IN_STREAM_NAME);
+      inputStreams.add("RESET_TRACKING:" + RESET_TRACKING_IN_STREAM_NAME);
+    }
     List<String> outputStreams = new ArrayList<>();
     outputStreams.add("NORM_LANDMARKS:pose_landmarks");
     outputStreams.add("WORLD_LANDMARKS:world_landmarks");
     outputStreams.add("IMAGE:image_out");
+    outputStreams.add("POSE_RECTS_NEXT_FRAME:pose_rects_next_frame");
     if (landmarkerOptions.outputSegmentationMasks()) {
       outputStreams.add("SEGMENTATION_MASK:segmentation_masks");
       segmentationMasksOutStreamIndex = outputStreams.size() - 1;
@@ -165,6 +185,7 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
             // If there is no poses detected in the image, just returns empty lists.
             if (packets.get(LANDMARKS_OUT_STREAM_INDEX).isEmpty()) {
               return PoseLandmarkerResult.create(
+                  new ArrayList<>(),
                   new ArrayList<>(),
                   new ArrayList<>(),
                   Optional.empty(),
@@ -182,6 +203,11 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
                     packets.get(LANDMARKS_OUT_STREAM_INDEX), NormalizedLandmarkList.parser()),
                 PacketGetter.getProtoVector(
                     packets.get(WORLD_LANDMARKS_OUT_STREAM_INDEX), LandmarkList.parser()),
+                packets.get(POSE_RECTS_NEXT_FRAME_OUT_STREAM_INDEX).isEmpty()
+                    ? new ArrayList<>()
+                    : PacketGetter.getProtoVector(
+                        packets.get(POSE_RECTS_NEXT_FRAME_OUT_STREAM_INDEX),
+                        RectProto.NormalizedRect.parser()),
                 segmentedMasks,
                 BaseVisionTaskApi.generateResultTimestampMs(
                     landmarkerOptions.runningMode(), packets.get(LANDMARKS_OUT_STREAM_INDEX)));
@@ -203,7 +229,7 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
                 .setTaskName(PoseLandmarker.class.getSimpleName())
                 .setTaskRunningModeName(landmarkerOptions.runningMode().name())
                 .setTaskGraphName(TASK_GRAPH_NAME)
-                .setInputStreams(INPUT_STREAMS)
+                .setInputStreams(inputStreams)
                 .setOutputStreams(outputStreams)
                 .setTaskOptions(landmarkerOptions)
                 .setEnableFlowLimiting(landmarkerOptions.runningMode() == RunningMode.LIVE_STREAM)
@@ -293,6 +319,26 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
   }
 
   /**
+   * Clears the retained pose rectangle on the next video frame while keeping this landmarker and
+   * its loaded model alive.
+   *
+   * <p>Use this at an input discontinuity such as a seek or source replacement, before submitting
+   * the first frame from the new sequence. The next frame bypasses the previous-frame rectangle and
+   * runs pose detection again. Input timestamps must remain monotonically increasing; this method
+   * does not restart the graph or its timestamp timeline.
+   *
+   * @throws MediaPipeException if this task is not in video mode.
+   */
+  public void resetTracking() {
+    if (runningMode != RunningMode.VIDEO) {
+      throw new MediaPipeException(
+          MediaPipeException.StatusCode.FAILED_PRECONDITION.ordinal(),
+          "Pose tracking reset requires video mode. Current running mode:" + runningMode.name());
+    }
+    resetTrackingPending.set(true);
+  }
+
+  /**
    * Performs pose landmarks detection on the provided video frame. Only use this method when the
    * {@link PoseLandmarker} is created with {@link RunningMode.VIDEO}.
    *
@@ -318,7 +364,100 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
   public PoseLandmarkerResult detectForVideo(
       MPImage image, ImageProcessingOptions imageProcessingOptions, long timestampMs) {
     validateImageProcessingOptions(imageProcessingOptions);
-    return (PoseLandmarkerResult) processVideoData(image, imageProcessingOptions, timestampMs);
+    return processVideoData(image, imageProcessingOptions, Optional.empty(), timestampMs);
+  }
+
+  /**
+   * Performs pose landmarks detection on a video frame using an externally supplied pose region.
+   *
+   * <p>The external rectangle bypasses this landmarker instance's retained tracking rectangle and
+   * is passed directly to pose landmark inference. A rectangle returned by {@link
+   * PoseLandmarkerResult#poseRectsNextFrame()} can be passed without further expansion.
+   *
+   * @param image a MediaPipe {@link MPImage} object for processing.
+   * @param externalPoseRect the normalized pose rectangle to use for landmark inference.
+   * @param timestampMs the input timestamp (in milliseconds).
+   * @throws IllegalArgumentException if the external pose rectangle is invalid.
+   * @throws MediaPipeException if there is an internal error.
+   */
+  public PoseLandmarkerResult detectForVideo(
+      MPImage image, NormalizedRect externalPoseRect, long timestampMs) {
+    return detectForVideo(
+        image, ImageProcessingOptions.builder().build(), externalPoseRect, timestampMs);
+  }
+
+  /**
+   * Performs pose landmarks detection on a video frame using image processing options and an
+   * externally supplied pose region.
+   *
+   * <p>The external rectangle bypasses this landmarker instance's retained tracking rectangle and
+   * is passed directly to pose landmark inference. A rectangle returned by {@link
+   * PoseLandmarkerResult#poseRectsNextFrame()} can be passed without further expansion.
+   *
+   * @param image a MediaPipe {@link MPImage} object for processing.
+   * @param imageProcessingOptions options specifying image rotation. Region-of-interest remains
+   *     unsupported because {@code externalPoseRect} is the landmark inference region.
+   * @param externalPoseRect the normalized pose rectangle to use for landmark inference.
+   * @param timestampMs the input timestamp (in milliseconds).
+   * @throws IllegalArgumentException if the options or external pose rectangle are invalid.
+   * @throws MediaPipeException if there is an internal error.
+   */
+  public PoseLandmarkerResult detectForVideo(
+      MPImage image,
+      ImageProcessingOptions imageProcessingOptions,
+      NormalizedRect externalPoseRect,
+      long timestampMs) {
+    validateImageProcessingOptions(imageProcessingOptions);
+    validateExternalPoseRect(externalPoseRect);
+    return processVideoData(
+        image, imageProcessingOptions, Optional.of(externalPoseRect), timestampMs);
+  }
+
+  private PoseLandmarkerResult processVideoData(
+      MPImage image,
+      ImageProcessingOptions imageProcessingOptions,
+      Optional<NormalizedRect> externalPoseRect,
+      long timestampMs) {
+    Map<String, Packet> inputPackets = new HashMap<>();
+    inputPackets.put(IMAGE_IN_STREAM_NAME, runner.getPacketCreator().createImage(image));
+    inputPackets.put(
+        NORM_RECT_IN_STREAM_NAME,
+        runner
+            .getPacketCreator()
+            .createProto(convertToNormalizedRect(imageProcessingOptions, image)));
+    inputPackets.put(
+        EXTERNAL_POSE_RECT_IN_STREAM_NAME,
+        runner
+            .getPacketCreator()
+            .createProto(
+                externalPoseRect
+                    .orElseGet(() -> NormalizedRect.create(0.5f, 0.5f, 1.0f, 1.0f, 0.0f))
+                    .toProto()));
+    inputPackets.put(
+        USE_EXTERNAL_POSE_RECT_IN_STREAM_NAME,
+        runner.getPacketCreator().createBool(externalPoseRect.isPresent()));
+    inputPackets.put(
+        RESET_TRACKING_IN_STREAM_NAME,
+        runner.getPacketCreator().createBool(resetTrackingPending.getAndSet(false)));
+    return (PoseLandmarkerResult) super.processVideoData(inputPackets, timestampMs);
+  }
+
+  private static void validateExternalPoseRect(NormalizedRect rect) {
+    if (rect == null
+        || !isFinite(rect.xCenter())
+        || !isFinite(rect.yCenter())
+        || !isFinite(rect.width())
+        || !isFinite(rect.height())
+        || !isFinite(rect.rotationRadians())
+        || rect.width() <= 0.0f
+        || rect.height() <= 0.0f) {
+      throw new IllegalArgumentException(
+          "External pose rectangle values must be finite and its width and height must be positive.");
+    }
+  }
+
+  private static boolean isFinite(float value) {
+    return !Float.isNaN(value) && !Float.isInfinite(value);
   }
 
   /**

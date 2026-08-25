@@ -19,6 +19,7 @@ import com.google.mediapipe.formats.proto.LandmarkProto;
 import com.google.mediapipe.framework.image.MPImage;
 import com.google.mediapipe.tasks.components.containers.Landmark;
 import com.google.mediapipe.tasks.components.containers.NormalizedLandmark;
+import com.google.mediapipe.tasks.components.containers.NormalizedRect;
 import com.google.mediapipe.tasks.core.TaskResult;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -35,11 +36,15 @@ public abstract class PoseLandmarkerResult implements TaskResult {
    *
    * @param landmarksProto a List of {@link NormalizedLandmarkList}
    * @param worldLandmarksProto a List of {@link LandmarkList}
+   * @param poseRectsNextFrameProto a List of normalized pose rectangles calculated for the next
+   *     video frame
    * @param segmentationMasksData a List of {@link MPImage}
    */
   static PoseLandmarkerResult create(
       List<LandmarkProto.NormalizedLandmarkList> landmarksProto,
       List<LandmarkProto.LandmarkList> worldLandmarksProto,
+      List<com.google.mediapipe.formats.proto.RectProto.NormalizedRect>
+          poseRectsNextFrameProto,
       Optional<List<MPImage>> segmentationMasksData,
       long timestampMs) {
 
@@ -62,11 +67,31 @@ public abstract class PoseLandmarkerResult implements TaskResult {
       multiPoseWorldLandmarks.add(Collections.unmodifiableList(poseWorldLandmarks));
     }
 
+    List<NormalizedRect> poseRectsNextFrame = new ArrayList<>();
+    for (com.google.mediapipe.formats.proto.RectProto.NormalizedRect rectProto :
+        poseRectsNextFrameProto) {
+      poseRectsNextFrame.add(NormalizedRect.createFromProto(rectProto));
+    }
+
     return new AutoValue_PoseLandmarkerResult(
         timestampMs,
         Collections.unmodifiableList(multiPoseLandmarks),
         Collections.unmodifiableList(multiPoseWorldLandmarks),
+        Collections.unmodifiableList(poseRectsNextFrame),
         multiPoseSegmentationMasks);
+  }
+
+  static PoseLandmarkerResult create(
+      List<LandmarkProto.NormalizedLandmarkList> landmarksProto,
+      List<LandmarkProto.LandmarkList> worldLandmarksProto,
+      Optional<List<MPImage>> segmentationMasksData,
+      long timestampMs) {
+    return create(
+        landmarksProto,
+        worldLandmarksProto,
+        Collections.emptyList(),
+        segmentationMasksData,
+        timestampMs);
   }
 
   @Override
@@ -77,6 +102,15 @@ public abstract class PoseLandmarkerResult implements TaskResult {
 
   /** Pose landmarks in world coordinates of detected poses. */
   public abstract List<List<Landmark>> worldLandmarks();
+
+  /**
+   * Normalized, expanded pose rectangles calculated for landmark detection on the next video
+   * frame.
+   *
+   * <p>These rectangles can be supplied to {@link PoseLandmarker#detectForVideo(MPImage,
+   * NormalizedRect, long)} so multiple landmarker instances can share one tracking state.
+   */
+  public abstract List<NormalizedRect> poseRectsNextFrame();
 
   /** Pose segmentation masks. */
   public abstract Optional<List<MPImage>> segmentationMasks();
