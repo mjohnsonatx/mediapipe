@@ -1,1 +1,2 @@
-/home/michaeljohnson/StudioProjects/mediapipe/.dockerignore
+.git
+Dockerfile
