@@ -38,6 +38,7 @@ public abstract class PoseLandmarkerResult implements TaskResult {
    * @param worldLandmarksProto a List of {@link LandmarkList}
    * @param poseRectsNextFrameProto a List of normalized pose rectangles calculated for the next
    *     video frame
+   * @param poseDetectorRan whether the pose detector graph ran for this frame
    * @param segmentationMasksData a List of {@link MPImage}
    */
   static PoseLandmarkerResult create(
@@ -45,6 +46,7 @@ public abstract class PoseLandmarkerResult implements TaskResult {
       List<LandmarkProto.LandmarkList> worldLandmarksProto,
       List<com.google.mediapipe.formats.proto.RectProto.NormalizedRect>
           poseRectsNextFrameProto,
+      boolean poseDetectorRan,
       Optional<List<MPImage>> segmentationMasksData,
       long timestampMs) {
 
@@ -78,6 +80,7 @@ public abstract class PoseLandmarkerResult implements TaskResult {
         Collections.unmodifiableList(multiPoseLandmarks),
         Collections.unmodifiableList(multiPoseWorldLandmarks),
         Collections.unmodifiableList(poseRectsNextFrame),
+        poseDetectorRan,
         multiPoseSegmentationMasks);
   }
 
@@ -90,6 +93,7 @@ public abstract class PoseLandmarkerResult implements TaskResult {
         landmarksProto,
         worldLandmarksProto,
         Collections.emptyList(),
+        false,
         segmentationMasksData,
         timestampMs);
   }
@@ -111,6 +115,15 @@ public abstract class PoseLandmarkerResult implements TaskResult {
    * NormalizedRect, long)} so multiple landmarker instances can share one tracking state.
    */
   public abstract List<NormalizedRect> poseRectsNextFrame();
+
+  /**
+   * Whether the full-image pose detector graph ran for this frame.
+   *
+   * <p>A false value means MediaPipe skipped pose identification and sent an existing tracking
+   * rectangle directly to landmark inference. This is execution telemetry, not a statement about
+   * whether landmarks were present.
+   */
+  public abstract boolean poseDetectorRan();
 
   /** Pose segmentation masks. */
   public abstract Optional<List<MPImage>> segmentationMasks();

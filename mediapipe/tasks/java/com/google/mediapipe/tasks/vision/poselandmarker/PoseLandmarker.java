@@ -94,6 +94,7 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
   private static final int WORLD_LANDMARKS_OUT_STREAM_INDEX = 1;
   private static final int IMAGE_OUT_STREAM_INDEX = 2;
   private static final int POSE_RECTS_NEXT_FRAME_OUT_STREAM_INDEX = 3;
+  private static final int POSE_DETECTIONS_OUT_STREAM_INDEX = 4;
   private static int segmentationMasksOutStreamIndex = -1;
   private static final String TASK_GRAPH_NAME =
       "mediapipe.tasks.vision.pose_landmarker.PoseLandmarkerGraph";
@@ -171,6 +172,7 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
     outputStreams.add("WORLD_LANDMARKS:world_landmarks");
     outputStreams.add("IMAGE:image_out");
     outputStreams.add("POSE_RECTS_NEXT_FRAME:pose_rects_next_frame");
+    outputStreams.add("DETECTIONS:pose_detections");
     if (landmarkerOptions.outputSegmentationMasks()) {
       outputStreams.add("SEGMENTATION_MASK:segmentation_masks");
       segmentationMasksOutStreamIndex = outputStreams.size() - 1;
@@ -188,6 +190,7 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
                   new ArrayList<>(),
                   new ArrayList<>(),
                   new ArrayList<>(),
+                  !packets.get(POSE_DETECTIONS_OUT_STREAM_INDEX).isEmpty(),
                   Optional.empty(),
                   BaseVisionTaskApi.generateResultTimestampMs(
                       landmarkerOptions.runningMode(), packets.get(LANDMARKS_OUT_STREAM_INDEX)));
@@ -208,6 +211,7 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
                     : PacketGetter.getProtoVector(
                         packets.get(POSE_RECTS_NEXT_FRAME_OUT_STREAM_INDEX),
                         RectProto.NormalizedRect.parser()),
+                !packets.get(POSE_DETECTIONS_OUT_STREAM_INDEX).isEmpty(),
                 segmentedMasks,
                 BaseVisionTaskApi.generateResultTimestampMs(
                     landmarkerOptions.runningMode(), packets.get(LANDMARKS_OUT_STREAM_INDEX)));

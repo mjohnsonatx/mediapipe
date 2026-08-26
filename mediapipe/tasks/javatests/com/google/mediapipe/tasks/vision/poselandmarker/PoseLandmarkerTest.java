@@ -273,6 +273,7 @@ public class PoseLandmarkerTest {
                   getImageFromAsset(POSE_IMAGE), externalPoseRect, /* timestampsMs= */ i);
       assertActualResultApproximatelyEqualsToExpectedResult(actualResult, expectedResult);
       assertThat(actualResult.poseRectsNextFrame()).hasSize(1);
+      assertThat(actualResult.poseDetectorRan()).isEqualTo(i == 0);
       externalPoseRect = actualResult.poseRectsNextFrame().get(0);
     }
   }
@@ -297,6 +298,8 @@ public class PoseLandmarkerTest {
 
       assertActualResultApproximatelyEqualsToExpectedResult(beforeReset, expectedResult);
       assertActualResultApproximatelyEqualsToExpectedResult(afterReset, expectedResult);
+      assertThat(beforeReset.poseDetectorRan()).isTrue();
+      assertThat(afterReset.poseDetectorRan()).isTrue();
       assertThat(afterReset.poseRectsNextFrame()).hasSize(1);
     }
   }
