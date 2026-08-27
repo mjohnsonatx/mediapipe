@@ -181,6 +181,9 @@ void ConfigureAlignmentPointsRectsCalculator(
 // All returned coordinates are in the unrotated and uncropped input image
 // coordinates system.
 //
+
+
+
 // Example:
 // node {
 //   calculator: "mediapipe.tasks.vision.pose_detector.PoseDetectorGraph"
