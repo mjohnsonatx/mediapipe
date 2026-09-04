@@ -14,6 +14,7 @@ limitations under the License.
 ==============================================================================*/
 
 #include <optional>
+#include <utility>
 #include <vector>
 
 #include "absl/status/status.h"
@@ -69,6 +70,11 @@ constexpr char kImageTag[] = "IMAGE";
 constexpr char kNormRectTag[] = "NORM_RECT";
 constexpr char kExternalPoseRectTag[] = "EXTERNAL_POSE_RECT";
 constexpr char kUseExternalPoseRectTag[] = "USE_EXTERNAL_POSE_RECT";
+constexpr char kExternalSourceProjectionRectTag[] =
+    "EXTERNAL_SOURCE_PROJECTION_RECT";
+constexpr char kExternalSourceImageSizeTag[] = "EXTERNAL_SOURCE_IMAGE_SIZE";
+constexpr char kUseExternalSourceProjectionTag[] =
+    "USE_EXTERNAL_SOURCE_PROJECTION";
 constexpr char kResetTrackingTag[] = "RESET_TRACKING";
 constexpr char kNormLandmarksTag[] = "NORM_LANDMARKS";
 constexpr char kWorldLandmarksTag[] = "WORLD_LANDMARKS";
@@ -177,6 +183,16 @@ absl::Status SetSubTaskBaseOptions(const ModelAssetBundleResources& resources,
 //   USE_EXTERNAL_POSE_RECT - bool @Optional
 //     Whether EXTERNAL_POSE_RECT should override the internally tracked pose
 //     rectangle for this timestamp.
+//   EXTERNAL_SOURCE_PROJECTION_RECT - NormalizedRect @Optional
+//     Source-image rectangle represented by an already-cropped IMAGE. This is
+//     used for output projection and smoothing, not image preprocessing.
+//   EXTERNAL_SOURCE_IMAGE_SIZE - std::pair<int, int> @Optional
+//     Width and height of the source image described by
+//     EXTERNAL_SOURCE_PROJECTION_RECT.
+//   USE_EXTERNAL_SOURCE_PROJECTION - bool @Optional
+//     Whether the external source projection rectangle and image size should
+//     override the IMAGE coordinate system for this timestamp. All three
+//     external source projection inputs must be connected together.
 //   RESET_TRACKING - bool @Optional
 //     When true, ignores the internally tracked pose rectangle for this
 //     timestamp so pose detection runs again.
@@ -210,6 +226,11 @@ absl::Status SetSubTaskBaseOptions(const ModelAssetBundleResources& resources,
 //   input_stream: "NORM_RECT:norm_rect"
 //   input_stream: "EXTERNAL_POSE_RECT:external_pose_rect"
 //   input_stream: "USE_EXTERNAL_POSE_RECT:use_external_pose_rect"
+//   input_stream:
+//     "EXTERNAL_SOURCE_PROJECTION_RECT:external_source_projection_rect"
+//   input_stream: "EXTERNAL_SOURCE_IMAGE_SIZE:external_source_image_size"
+//   input_stream:
+//     "USE_EXTERNAL_SOURCE_PROJECTION:use_external_source_projection"
 //   input_stream: "RESET_TRACKING:reset_tracking"
 //   output_stream: "NORM_LANDMARKS:pose_landmarks"
 //   output_stream: "WORLD_LANDMARKS:world_landmarks"
@@ -274,6 +295,32 @@ class PoseLandmarkerGraph : public core::ModelTaskGraph {
       use_external_pose_rect_in =
           graph.In(kUseExternalPoseRectTag).Cast<bool>();
     }
+    const bool has_external_source_projection_rect =
+        HasInput(sc->OriginalNode(), kExternalSourceProjectionRectTag);
+    const bool has_external_source_image_size =
+        HasInput(sc->OriginalNode(), kExternalSourceImageSizeTag);
+    const bool has_use_external_source_projection =
+        HasInput(sc->OriginalNode(), kUseExternalSourceProjectionTag);
+    if (has_external_source_projection_rect !=
+            has_external_source_image_size ||
+        has_external_source_projection_rect !=
+            has_use_external_source_projection) {
+      return absl::InvalidArgumentError(
+          "EXTERNAL_SOURCE_PROJECTION_RECT, EXTERNAL_SOURCE_IMAGE_SIZE, and "
+          "USE_EXTERNAL_SOURCE_PROJECTION must either all be connected or "
+          "all be omitted.");
+    }
+    std::optional<Source<NormalizedRect>> external_source_projection_rect_in;
+    std::optional<Source<std::pair<int, int>>> external_source_image_size_in;
+    std::optional<Source<bool>> use_external_source_projection_in;
+    if (has_external_source_projection_rect) {
+      external_source_projection_rect_in =
+          graph.In(kExternalSourceProjectionRectTag).Cast<NormalizedRect>();
+      external_source_image_size_in =
+          graph.In(kExternalSourceImageSizeTag).Cast<std::pair<int, int>>();
+      use_external_source_projection_in =
+          graph.In(kUseExternalSourceProjectionTag).Cast<bool>();
+    }
     std::optional<Source<bool>> reset_tracking_in;
     if (HasInput(sc->OriginalNode(), kResetTrackingTag)) {
       reset_tracking_in = graph.In(kResetTrackingTag).Cast<bool>();
@@ -284,6 +331,9 @@ class PoseLandmarkerGraph : public core::ModelTaskGraph {
                        graph[Input<Image>(kImageTag)],
                        graph[Input<NormalizedRect>::Optional(kNormRectTag)],
                        external_pose_rect_in, use_external_pose_rect_in,
+                       external_source_projection_rect_in,
+                       external_source_image_size_in,
+                       use_external_source_projection_in,
                        reset_tracking_in, graph, output_segmentation_masks));
     outs.landmark_lists >>
         graph[Output<std::vector<NormalizedLandmarkList>>(kNormLandmarksTag)];
@@ -319,6 +369,10 @@ class PoseLandmarkerGraph : public core::ModelTaskGraph {
       Source<NormalizedRect> norm_rect_in,
       std::optional<Source<NormalizedRect>> external_pose_rect_in,
       std::optional<Source<bool>> use_external_pose_rect_in,
+      std::optional<Source<NormalizedRect>>
+          external_source_projection_rect_in,
+      std::optional<Source<std::pair<int, int>>> external_source_image_size_in,
+      std::optional<Source<bool>> use_external_source_projection_in,
       std::optional<Source<bool>> reset_tracking_in, Graph& graph,
       bool output_segmentation_masks) {
     const int max_num_poses =
@@ -358,6 +412,15 @@ class PoseLandmarkerGraph : public core::ModelTaskGraph {
 
     image_in >> pose_landmarks_detector_graph.In(kImageTag);
     clipped_pose_rects >> pose_landmarks_detector_graph.In(kNormRectTag);
+    if (external_source_projection_rect_in && external_source_image_size_in &&
+        use_external_source_projection_in) {
+      *external_source_projection_rect_in >>
+          pose_landmarks_detector_graph.In(kExternalSourceProjectionRectTag);
+      *external_source_image_size_in >>
+          pose_landmarks_detector_graph.In(kExternalSourceImageSizeTag);
+      *use_external_source_projection_in >>
+          pose_landmarks_detector_graph.In(kUseExternalSourceProjectionTag);
+    }
 
     // TODO: Add landmarks smoothing calculators to
     // PoseLandmarkerGraph
@@ -441,10 +504,12 @@ class PoseLandmarkerGraph : public core::ModelTaskGraph {
       pose_rects_for_next_frame >> previous_loopback.In(kLoopTag);
     } else {
       if (external_pose_rect_in || use_external_pose_rect_in ||
+          external_source_projection_rect_in ||
+          external_source_image_size_in || use_external_source_projection_in ||
           reset_tracking_in) {
         return absl::InvalidArgumentError(
-            "External pose rectangles and tracking reset are only supported "
-            "in stream mode.");
+            "External pose rectangles, source projection, and tracking reset "
+            "are only supported in stream mode.");
       }
       // While not in stream mode, the input images are not guaranteed to be in
       // series, and we don't want to enable the tracking and rect associations

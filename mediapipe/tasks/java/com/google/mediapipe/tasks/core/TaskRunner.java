@@ -55,7 +55,31 @@ public class TaskRunner implements AutoCloseable {
       Context context,
       TaskInfo<? extends TaskOptions> taskInfo,
       OutputHandler<? extends TaskResult, ?> outputHandler) {
-    return create(context, taskInfo, outputHandler, /* extraSidePackets= */ null);
+    return create(
+        context,
+        taskInfo,
+        outputHandler,
+        /* extraSidePackets= */ null,
+        /* parentGlContext= */ 0L);
+  }
+
+  /**
+   * Creates a task graph whose GPU resources share objects with an application EGL context.
+   *
+   * <p>The context must remain alive for the lifetime of this runner. A value of {@code 0} keeps
+   * the default independent MediaPipe GPU context behavior.
+   */
+  public static TaskRunner create(
+      Context context,
+      TaskInfo<? extends TaskOptions> taskInfo,
+      OutputHandler<? extends TaskResult, ?> outputHandler,
+      long parentGlContext) {
+    return create(
+        context,
+        taskInfo,
+        outputHandler,
+        /* extraSidePackets= */ null,
+        parentGlContext);
   }
 
   /**
@@ -74,11 +98,29 @@ public class TaskRunner implements AutoCloseable {
       TaskInfo<? extends TaskOptions> taskInfo,
       OutputHandler<? extends TaskResult, ?> outputHandler,
       Map<String, Packet> extraSidePackets) {
+    return create(
+        context,
+        taskInfo,
+        outputHandler,
+        extraSidePackets,
+        /* parentGlContext= */ 0L);
+  }
+
+  /** Creates a task graph with optional side packets and an optional shared parent GL context. */
+  public static TaskRunner create(
+      Context context,
+      TaskInfo<? extends TaskOptions> taskInfo,
+      OutputHandler<? extends TaskResult, ?> outputHandler,
+      Map<String, Packet> extraSidePackets,
+      long parentGlContext) {
     TasksStatsLogger statsLogger =
         TasksStatsLoggerFactory.create(
             context, taskInfo.taskName(), taskInfo.taskRunningModeName());
     AndroidAssetUtil.initializeNativeAssetManager(context);
     Graph mediapipeGraph = new Graph();
+    if (parentGlContext != 0L) {
+      mediapipeGraph.setParentGlContext(parentGlContext);
+    }
     mediapipeGraph.loadBinaryGraph(taskInfo.generateGraphConfig());
     if (extraSidePackets != null && !extraSidePackets.isEmpty()) {
       mediapipeGraph.setInputSidePackets(extraSidePackets);

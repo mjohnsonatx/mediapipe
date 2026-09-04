@@ -11,9 +11,12 @@ VERS_1.0 {
     Java_com_google_mediapipe_framework_Graph_nativeLoadBinaryGraph*;
     Java_com_google_mediapipe_framework_Graph_nativeMovePacketToInputStream;
     Java_com_google_mediapipe_framework_Graph_nativeReleaseGraph;
+    Java_com_google_mediapipe_framework_Graph_nativeSetParentGlContext;
     Java_com_google_mediapipe_framework_Graph_nativeStartRunningGraph;
     Java_com_google_mediapipe_framework_Graph_nativeWaitUntilGraphDone;
     Java_com_google_mediapipe_framework_Graph_nativeWaitUntilGraphIdle;
+    Java_com_google_mediapipe_framework_GraphGlSyncToken_*;
+    Java_com_google_mediapipe_framework_GraphTextureFrame_*;
     Java_com_google_mediapipe_framework_PacketCreator*;
     Java_com_google_mediapipe_framework_PacketGetter*;
     Java_com_google_mediapipe_framework_Packet*;

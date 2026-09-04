@@ -810,6 +810,22 @@ http_archive(
     url = "https://curl.haxx.se/download/curl-8.10.1.tar.gz",
 )
 
+# Android AAR builds resolve these locations from ANDROID_HOME and ANDROID_NDK_HOME. Keeping the
+# paths environment-owned makes this fork buildable on developer workstations and CI agents.
+android_sdk_repository(name = "androidsdk")
+
+android_ndk_repository(
+    name = "androidndk",
+    api_level = 21,
+)
+
+bind(
+    name = "android/crosstool",
+    actual = "@androidndk//:toolchain",
+)
+
+register_toolchains("@androidsdk//:all", "@androidndk//:all")
+
 # LiteRT v2.1.6
 # Fetch just the source tree and let it use our already-defined workspace
 # dependencies (@org_tensorflow, @xla, etc.) to avoid collisions.

@@ -17,6 +17,7 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "mediapipe/calculators/core/constant_side_packet_calculator.pb.h"
 #include "mediapipe/calculators/core/split_vector_calculator.pb.h"
@@ -33,6 +34,7 @@ limitations under the License.
 #include "mediapipe/framework/api2/port.h"
 #include "mediapipe/framework/api2/stream/get_vector_item.h"
 #include "mediapipe/framework/api2/stream/image_size.h"
+#include "mediapipe/framework/api2/stream/merge.h"
 #include "mediapipe/framework/api2/stream/smoothing.h"
 #include "mediapipe/framework/formats/image.h"
 #include "mediapipe/framework/formats/landmark.pb.h"
@@ -41,6 +43,7 @@ limitations under the License.
 #include "mediapipe/gpu/gpu_origin.pb.h"
 #include "mediapipe/tasks/cc/common.h"
 #include "mediapipe/tasks/cc/components/processors/image_preprocessing_graph.h"
+#include "mediapipe/tasks/cc/components/utils/gate.h"
 #include "mediapipe/tasks/cc/core/model_resources.h"
 #include "mediapipe/tasks/cc/core/model_task_graph.h"
 #include "mediapipe/tasks/cc/vision/pose_landmarker/proto/pose_landmarks_detector_graph_options.pb.h"
@@ -57,16 +60,23 @@ using ::mediapipe::api2::Input;
 using ::mediapipe::api2::Output;
 using ::mediapipe::api2::builder::GetImageSize;
 using ::mediapipe::api2::builder::Graph;
+using ::mediapipe::api2::builder::Merge;
 using ::mediapipe::api2::builder::SmoothLandmarks;
 using ::mediapipe::api2::builder::SmoothLandmarksVisibility;
 using ::mediapipe::api2::builder::Source;
 using ::mediapipe::api2::builder::Stream;
+using ::mediapipe::tasks::components::utils::AllowIf;
 using ::mediapipe::tasks::core::ModelResources;
 using ::mediapipe::tasks::vision::pose_landmarker::proto::
     PoseLandmarksDetectorGraphOptions;
 
 constexpr char kImageTag[] = "IMAGE";
 constexpr char kNormRectTag[] = "NORM_RECT";
+constexpr char kExternalSourceProjectionRectTag[] =
+    "EXTERNAL_SOURCE_PROJECTION_RECT";
+constexpr char kExternalSourceImageSizeTag[] = "EXTERNAL_SOURCE_IMAGE_SIZE";
+constexpr char kUseExternalSourceProjectionTag[] =
+    "USE_EXTERNAL_SOURCE_PROJECTION";
 constexpr char kLandmarksTag[] = "LANDMARKS";
 constexpr char kNormLandmarksTag[] = "NORM_LANDMARKS";
 constexpr char kWorldLandmarksTag[] = "WORLD_LANDMARKS";
@@ -77,6 +87,7 @@ constexpr char kPresenceTag[] = "PRESENCE";
 constexpr char kPresenceScoreTag[] = "PRESENCE_SCORE";
 constexpr char kSegmentationMaskTag[] = "SEGMENTATION_MASK";
 constexpr char kImageSizeTag[] = "IMAGE_SIZE";
+constexpr char kImageDimensionsTag[] = "IMAGE_DIMENSIONS";
 constexpr char kLandmarksToTag[] = "LANDMARKS_TO";
 constexpr char kTensorsTag[] = "TENSORS";
 constexpr char kFloatTag[] = "FLOAT";
@@ -251,6 +262,15 @@ Stream<int> CreateIntConstantStream(Stream<TickT> tick_stream, int constant_int,
 //   NORM_RECT - NormalizedRect @Optional
 //     Rect enclosing the RoI to perform detection on. If not set, the detection
 //     RoI is the whole image.
+//   EXTERNAL_SOURCE_PROJECTION_RECT - NormalizedRect @Optional
+//     Source-image rectangle represented by an already-cropped IMAGE. When
+//     present, this rect is used for output projection but not preprocessing.
+//   EXTERNAL_SOURCE_IMAGE_SIZE - std::pair<int, int> @Optional
+//     Width and height of the source image. Must be connected together with
+//     EXTERNAL_SOURCE_PROJECTION_RECT.
+//   USE_EXTERNAL_SOURCE_PROJECTION - bool @Optional
+//     Whether the external source coordinate system should be used for this
+//     timestamp. All three external source inputs must be connected together.
 //
 //
 // Outputs:
@@ -305,13 +325,40 @@ class SinglePoseLandmarksDetectorGraph : public core::ModelTaskGraph {
         const auto* model_resources,
         CreateModelResources<PoseLandmarksDetectorGraphOptions>(sc));
     Graph graph;
+    const bool has_external_source_projection_rect =
+        HasInput(sc->OriginalNode(), kExternalSourceProjectionRectTag);
+    const bool has_external_source_image_size =
+        HasInput(sc->OriginalNode(), kExternalSourceImageSizeTag);
+    const bool has_use_external_source_projection =
+        HasInput(sc->OriginalNode(), kUseExternalSourceProjectionTag);
+    if (has_external_source_projection_rect !=
+            has_external_source_image_size ||
+        has_external_source_projection_rect !=
+            has_use_external_source_projection) {
+      return absl::InvalidArgumentError(
+          "EXTERNAL_SOURCE_PROJECTION_RECT, EXTERNAL_SOURCE_IMAGE_SIZE, and "
+          "USE_EXTERNAL_SOURCE_PROJECTION must either all be connected or "
+          "all be omitted.");
+    }
+    std::optional<Source<NormalizedRect>> external_source_projection_rect;
+    std::optional<Source<std::pair<int, int>>> external_source_image_size;
+    std::optional<Source<bool>> use_external_source_projection;
+    if (has_external_source_projection_rect) {
+      external_source_projection_rect =
+          graph.In(kExternalSourceProjectionRectTag).Cast<NormalizedRect>();
+      external_source_image_size =
+          graph.In(kExternalSourceImageSizeTag).Cast<std::pair<int, int>>();
+      use_external_source_projection =
+          graph.In(kUseExternalSourceProjectionTag).Cast<bool>();
+    }
     ABSL_ASSIGN_OR_RETURN(
         auto pose_landmark_detection_outs,
         BuildSinglePoseLandmarksDetectorGraph(
             sc->Options<PoseLandmarksDetectorGraphOptions>(), *model_resources,
             graph[Input<Image>(kImageTag)],
-            graph[Input<NormalizedRect>::Optional(kNormRectTag)], graph,
-            output_segmentation_mask));
+            graph[Input<NormalizedRect>::Optional(kNormRectTag)],
+            external_source_projection_rect, external_source_image_size,
+            use_external_source_projection, graph, output_segmentation_mask));
     pose_landmark_detection_outs.pose_landmarks >>
         graph[Output<NormalizedLandmarkList>(kLandmarksTag)];
     pose_landmark_detection_outs.world_pose_landmarks >>
@@ -337,7 +384,10 @@ class SinglePoseLandmarksDetectorGraph : public core::ModelTaskGraph {
   BuildSinglePoseLandmarksDetectorGraph(
       const PoseLandmarksDetectorGraphOptions& subgraph_options,
       const ModelResources& model_resources, Source<Image> image_in,
-      Source<NormalizedRect> pose_rect, Graph& graph,
+      Source<NormalizedRect> pose_rect,
+      std::optional<Source<NormalizedRect>> external_source_projection_rect,
+      std::optional<Source<std::pair<int, int>>> external_source_image_size,
+      std::optional<Source<bool>> use_external_source_projection, Graph& graph,
       bool output_segmentation_mask) {
     ABSL_RETURN_IF_ERROR(SanityCheckOptions(subgraph_options));
 
@@ -357,6 +407,30 @@ class SinglePoseLandmarksDetectorGraph : public core::ModelTaskGraph {
     auto image_size = preprocessing[Output<std::pair<int, int>>(kImageSizeTag)];
     auto matrix = preprocessing[Output<std::vector<float>>(kMatrixTag)];
     auto letterbox_padding = preprocessing.Out(kLetterboxPaddingTag);
+
+    // The application may have already transformed a source-image ROI into
+    // IMAGE. Keep preprocessing on the complete supplied image, then project
+    // model output back through the original source ROI. Merge provides the
+    // normal input-image behavior whenever the optional external streams are
+    // empty for a timestamp.
+    Stream<NormalizedRect> projection_rect = pose_rect;
+    Stream<std::pair<int, int>> projection_image_size = image_size;
+    if (external_source_projection_rect && external_source_image_size &&
+        use_external_source_projection) {
+      // Gate after BeginLoop has cloned all external metadata. Gating before
+      // BeginLoop leaves an empty CLONE input without a packet at the loop's
+      // synthetic timestamp, which can prevent this subgraph from advancing.
+      auto enabled_source_projection_rect =
+          AllowIf(*external_source_projection_rect,
+                  *use_external_source_projection, graph);
+      auto enabled_source_image_size =
+          AllowIf(*external_source_image_size,
+                  *use_external_source_projection, graph);
+      projection_rect =
+          Merge(enabled_source_projection_rect, pose_rect, graph);
+      projection_image_size =
+          Merge(enabled_source_image_size, image_size, graph);
+    }
 
     ABSL_ASSIGN_OR_RETURN(auto image_tensor_specs,
                           BuildInputImageTensorSpecs(model_resources));
@@ -488,7 +562,8 @@ class SinglePoseLandmarksDetectorGraph : public core::ModelTaskGraph {
     // Projects the landmarks.
     auto& landmarks_projection = graph.AddNode("LandmarkProjectionCalculator");
     adjusted_landmarks >> landmarks_projection.In(kNormLandmarksTag);
-    pose_rect >> landmarks_projection.In(kNormRectTag);
+    projection_rect >> landmarks_projection.In(kNormRectTag);
+    projection_image_size >> landmarks_projection.In(kImageDimensionsTag);
     auto projected_landmarks = landmarks_projection.Out(kNormLandmarksTag)
                                    .Cast<NormalizedLandmarkList>();
 
@@ -507,7 +582,9 @@ class SinglePoseLandmarksDetectorGraph : public core::ModelTaskGraph {
         graph.AddNode("LandmarkProjectionCalculator");
     auxiliary_adjusted_landmarks >>
         auxiliary_landmarks_projection.In(kNormLandmarksTag);
-    pose_rect >> auxiliary_landmarks_projection.In(kNormRectTag);
+    projection_rect >> auxiliary_landmarks_projection.In(kNormRectTag);
+    projection_image_size >>
+        auxiliary_landmarks_projection.In(kImageDimensionsTag);
     auto auxiliary_projected_landmarks =
         auxiliary_landmarks_projection.Out(kNormLandmarksTag)
             .Cast<NormalizedLandmarkList>();
@@ -516,7 +593,7 @@ class SinglePoseLandmarksDetectorGraph : public core::ModelTaskGraph {
     auto& world_landmarks_projection =
         graph.AddNode("WorldLandmarkProjectionCalculator");
     world_landmarks >> world_landmarks_projection.In(kLandmarksTag);
-    pose_rect >> world_landmarks_projection.In(kNormRectTag);
+    projection_rect >> world_landmarks_projection.In(kNormRectTag);
     auto world_projected_landmarks =
         world_landmarks_projection.Out(kLandmarksTag).Cast<LandmarkList>();
 
@@ -564,14 +641,14 @@ class SinglePoseLandmarksDetectorGraph : public core::ModelTaskGraph {
         &detection_to_rect
              .GetOptions<mediapipe::DetectionsToRectsCalculatorOptions>());
     detection >> detection_to_rect.In(kDetectionTag);
-    image_size >> detection_to_rect.In(kImageSizeTag);
+    projection_image_size >> detection_to_rect.In(kImageSizeTag);
     auto raw_pose_rects = detection_to_rect.Out(kNormRectTag);
 
     auto& rect_transformation = graph.AddNode("RectTransformationCalculator");
     ConfigureRectTransformationCalculator(
         &rect_transformation
              .GetOptions<mediapipe::RectTransformationCalculatorOptions>());
-    image_size >> rect_transformation.In(kImageSizeTag);
+    projection_image_size >> rect_transformation.In(kImageSizeTag);
     raw_pose_rects >> rect_transformation.In("NORM_RECT");
     auto pose_rect_next_frame = rect_transformation[Output<NormalizedRect>("")];
 
@@ -605,6 +682,13 @@ REGISTER_MEDIAPIPE_GRAPH(
 //   NORM_RECT - std::vector<NormalizedRect>
 //     A vector of multiple pose rects enclosing the pose RoI to perform
 //     landmarks detection on.
+//   EXTERNAL_SOURCE_PROJECTION_RECT - NormalizedRect @Optional
+//     Source-image rectangle represented by an already-cropped IMAGE.
+//   EXTERNAL_SOURCE_IMAGE_SIZE - std::pair<int, int> @Optional
+//     Width and height of that source image.
+//   USE_EXTERNAL_SOURCE_PROJECTION - bool @Optional
+//     Whether the external source coordinate system should be used for this
+//     timestamp. All three external source inputs must be connected together.
 //
 //
 // Outputs:
@@ -656,12 +740,40 @@ class MultiplePoseLandmarksDetectorGraph : public core::ModelTaskGraph {
     Graph graph;
     bool output_segmentation_masks =
         HasOutput(sc->OriginalNode(), kSegmentationMaskTag);
+    const bool has_external_source_projection_rect =
+        HasInput(sc->OriginalNode(), kExternalSourceProjectionRectTag);
+    const bool has_external_source_image_size =
+        HasInput(sc->OriginalNode(), kExternalSourceImageSizeTag);
+    const bool has_use_external_source_projection =
+        HasInput(sc->OriginalNode(), kUseExternalSourceProjectionTag);
+    if (has_external_source_projection_rect !=
+            has_external_source_image_size ||
+        has_external_source_projection_rect !=
+            has_use_external_source_projection) {
+      return absl::InvalidArgumentError(
+          "EXTERNAL_SOURCE_PROJECTION_RECT, EXTERNAL_SOURCE_IMAGE_SIZE, and "
+          "USE_EXTERNAL_SOURCE_PROJECTION must either all be connected or "
+          "all be omitted.");
+    }
+    std::optional<Source<NormalizedRect>> external_source_projection_rect;
+    std::optional<Source<std::pair<int, int>>> external_source_image_size;
+    std::optional<Source<bool>> use_external_source_projection;
+    if (has_external_source_projection_rect) {
+      external_source_projection_rect =
+          graph.In(kExternalSourceProjectionRectTag).Cast<NormalizedRect>();
+      external_source_image_size =
+          graph.In(kExternalSourceImageSizeTag).Cast<std::pair<int, int>>();
+      use_external_source_projection =
+          graph.In(kUseExternalSourceProjectionTag).Cast<bool>();
+    }
     ABSL_ASSIGN_OR_RETURN(
         auto pose_landmark_detection_outputs,
         BuildPoseLandmarksDetectorGraph(
             sc->Options<PoseLandmarksDetectorGraphOptions>(),
             graph[Input<Image>(kImageTag)],
-            graph[Input<std::vector<NormalizedRect>>(kNormRectTag)], graph,
+            graph[Input<std::vector<NormalizedRect>>(kNormRectTag)],
+            external_source_projection_rect, external_source_image_size,
+            use_external_source_projection, graph,
             output_segmentation_masks));
     pose_landmark_detection_outputs.landmark_lists >>
         graph[Output<std::vector<NormalizedLandmarkList>>(kLandmarksTag)];
@@ -687,15 +799,50 @@ class MultiplePoseLandmarksDetectorGraph : public core::ModelTaskGraph {
   absl::StatusOr<PoseLandmarkerOutputs> BuildPoseLandmarksDetectorGraph(
       const PoseLandmarksDetectorGraphOptions& subgraph_options,
       Source<Image> image_in,
-      Source<std::vector<NormalizedRect>> multi_pose_rects, Graph& graph,
+      Source<std::vector<NormalizedRect>> multi_pose_rects,
+      std::optional<Source<NormalizedRect>> external_source_projection_rect,
+      std::optional<Source<std::pair<int, int>>> external_source_image_size,
+      std::optional<Source<bool>> use_external_source_projection, Graph& graph,
       bool output_segmentation_masks) {
+    Stream<std::pair<int, int>> smoothing_image_size =
+        GetImageSize(image_in, graph);
+    std::optional<Stream<std::pair<int, int>>> gated_source_image_size;
+    if (external_source_projection_rect && external_source_image_size &&
+        use_external_source_projection) {
+      gated_source_image_size =
+          AllowIf(*external_source_image_size,
+                  *use_external_source_projection, graph);
+      smoothing_image_size =
+          Merge(*gated_source_image_size, smoothing_image_size, graph);
+    }
+
     auto& begin_loop_multi_pose_rects =
         graph.AddNode("BeginLoopNormalizedRectCalculator");
-    image_in >> begin_loop_multi_pose_rects.In("CLONE");
+    image_in >> begin_loop_multi_pose_rects.In("CLONE")[0];
     multi_pose_rects >> begin_loop_multi_pose_rects.In("ITERABLE");
     auto batch_end = begin_loop_multi_pose_rects.Out("BATCH_END");
-    auto image = begin_loop_multi_pose_rects.Out("CLONE");
+    auto image = begin_loop_multi_pose_rects.Out("CLONE")[0];
     auto pose_rect = begin_loop_multi_pose_rects.Out("ITEM");
+    std::optional<Source<NormalizedRect>> loop_source_projection_rect;
+    std::optional<Source<std::pair<int, int>>> loop_source_image_size;
+    std::optional<Source<bool>> loop_use_external_source_projection;
+    if (external_source_projection_rect && external_source_image_size &&
+        use_external_source_projection) {
+      *external_source_projection_rect >>
+          begin_loop_multi_pose_rects.In("CLONE")[1];
+      *external_source_image_size >>
+          begin_loop_multi_pose_rects.In("CLONE")[2];
+      *use_external_source_projection >>
+          begin_loop_multi_pose_rects.In("CLONE")[3];
+      loop_source_projection_rect =
+          begin_loop_multi_pose_rects.Out("CLONE")[1]
+              .Cast<NormalizedRect>();
+      loop_source_image_size =
+          begin_loop_multi_pose_rects.Out("CLONE")[2]
+              .Cast<std::pair<int, int>>();
+      loop_use_external_source_projection =
+          begin_loop_multi_pose_rects.Out("CLONE")[3].Cast<bool>();
+    }
 
     auto& pose_landmark_subgraph = graph.AddNode(
         "mediapipe.tasks.vision.pose_landmarker."
@@ -704,6 +851,15 @@ class MultiplePoseLandmarksDetectorGraph : public core::ModelTaskGraph {
         subgraph_options;
     image >> pose_landmark_subgraph.In(kImageTag);
     pose_rect >> pose_landmark_subgraph.In(kNormRectTag);
+    if (loop_source_projection_rect && loop_source_image_size &&
+        loop_use_external_source_projection) {
+      *loop_source_projection_rect >>
+          pose_landmark_subgraph.In(kExternalSourceProjectionRectTag);
+      *loop_source_image_size >>
+          pose_landmark_subgraph.In(kExternalSourceImageSizeTag);
+      *loop_use_external_source_projection >>
+          pose_landmark_subgraph.In(kUseExternalSourceProjectionTag);
+    }
     auto landmarks = pose_landmark_subgraph.Out(kLandmarksTag);
     auto world_landmarks = pose_landmark_subgraph.Out(kWorldLandmarksTag);
     auto auxiliary_landmarks = pose_landmark_subgraph.Out(kAuxLandmarksTag);
@@ -772,7 +928,6 @@ class MultiplePoseLandmarksDetectorGraph : public core::ModelTaskGraph {
     // to smoote landmarks across frames but the for loop calculator makes fake
     // timestamps for the streams.
     if (subgraph_options.smooth_landmarks()) {
-      Stream<std::pair<int, int>> image_size = GetImageSize(image_in, graph);
       Stream<int> zero_index =
           CreateIntConstantStream(landmark_lists, 0, graph);
       Stream<NormalizedLandmarkList> landmarks =
@@ -786,7 +941,7 @@ class MultiplePoseLandmarksDetectorGraph : public core::ModelTaskGraph {
       landmarks = SmoothLandmarksVisibility(
           landmarks, /*low_pass_filter_alpha=*/0.1f, graph);
       landmarks = SmoothLandmarks(
-          landmarks, image_size, roi,
+          landmarks, smoothing_image_size, roi,
           {// Min cutoff 0.05 results into ~0.01 alpha in landmark EMA filter
            // when landmark is static.
            /*min_cutoff=*/0.05f,

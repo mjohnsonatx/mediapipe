@@ -25,6 +25,7 @@ import com.google.mediapipe.framework.AndroidPacketGetter;
 import com.google.mediapipe.framework.MediaPipeException;
 import com.google.mediapipe.framework.Packet;
 import com.google.mediapipe.framework.PacketGetter;
+import com.google.mediapipe.framework.TextureFrame;
 import com.google.mediapipe.framework.image.BitmapImageBuilder;
 import com.google.mediapipe.framework.image.ByteBufferImageBuilder;
 import com.google.mediapipe.framework.image.MPImage;
@@ -81,7 +82,15 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
   private static final String EXTERNAL_POSE_RECT_IN_STREAM_NAME = "external_pose_rect_in";
   private static final String USE_EXTERNAL_POSE_RECT_IN_STREAM_NAME =
       "use_external_pose_rect_in";
+  private static final String EXTERNAL_SOURCE_PROJECTION_RECT_IN_STREAM_NAME =
+      "external_source_projection_rect_in";
+  private static final String EXTERNAL_SOURCE_IMAGE_SIZE_IN_STREAM_NAME =
+      "external_source_image_size_in";
+  private static final String USE_EXTERNAL_SOURCE_PROJECTION_IN_STREAM_NAME =
+      "use_external_source_projection_in";
   private static final String RESET_TRACKING_IN_STREAM_NAME = "reset_tracking_in";
+  private static final NormalizedRect FULL_IMAGE_TRACKING_RECT =
+      NormalizedRect.create(0.5f, 0.5f, 1.0f, 1.0f, 0.0f);
 
   private final AtomicBoolean resetTrackingPending = new AtomicBoolean(false);
 
@@ -160,11 +169,38 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
    */
   public static PoseLandmarker createFromOptions(
       Context context, PoseLandmarkerOptions landmarkerOptions) {
+    return createFromOptionsInternal(context, landmarkerOptions, /* parentGlContext= */ 0L);
+  }
+
+  /**
+   * Creates a {@link PoseLandmarker} whose GPU resources share application-owned GL objects.
+   *
+   * <p>The caller must keep {@code parentGlContext} alive until this landmarker is closed. This
+   * overload is intended for application-owned {@link TextureFrame} inputs.
+   */
+  public static PoseLandmarker createFromOptions(
+      Context context, PoseLandmarkerOptions landmarkerOptions, long parentGlContext) {
+    if (parentGlContext == 0L) {
+      throw new IllegalArgumentException("The parent GL context handle must be non-zero.");
+    }
+    return createFromOptionsInternal(context, landmarkerOptions, parentGlContext);
+  }
+
+  private static PoseLandmarker createFromOptionsInternal(
+      Context context, PoseLandmarkerOptions landmarkerOptions, long parentGlContext) {
     List<String> inputStreams = new ArrayList<>(BASE_INPUT_STREAMS);
     if (landmarkerOptions.runningMode() == RunningMode.VIDEO) {
       inputStreams.add("EXTERNAL_POSE_RECT:" + EXTERNAL_POSE_RECT_IN_STREAM_NAME);
       inputStreams.add(
           "USE_EXTERNAL_POSE_RECT:" + USE_EXTERNAL_POSE_RECT_IN_STREAM_NAME);
+      inputStreams.add(
+          "EXTERNAL_SOURCE_PROJECTION_RECT:"
+              + EXTERNAL_SOURCE_PROJECTION_RECT_IN_STREAM_NAME);
+      inputStreams.add(
+          "EXTERNAL_SOURCE_IMAGE_SIZE:" + EXTERNAL_SOURCE_IMAGE_SIZE_IN_STREAM_NAME);
+      inputStreams.add(
+          "USE_EXTERNAL_SOURCE_PROJECTION:"
+              + USE_EXTERNAL_SOURCE_PROJECTION_IN_STREAM_NAME);
       inputStreams.add("RESET_TRACKING:" + RESET_TRACKING_IN_STREAM_NAME);
     }
     List<String> outputStreams = new ArrayList<>();
@@ -238,7 +274,8 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
                 .setTaskOptions(landmarkerOptions)
                 .setEnableFlowLimiting(landmarkerOptions.runningMode() == RunningMode.LIVE_STREAM)
                 .build(),
-            handler);
+            handler,
+            parentGlContext);
     return new PoseLandmarker(runner, landmarkerOptions.runningMode());
   }
 
@@ -368,7 +405,14 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
   public PoseLandmarkerResult detectForVideo(
       MPImage image, ImageProcessingOptions imageProcessingOptions, long timestampMs) {
     validateImageProcessingOptions(imageProcessingOptions);
-    return processVideoData(image, imageProcessingOptions, Optional.empty(), timestampMs);
+    return processVideoData(
+        image,
+        imageProcessingOptions,
+        Optional.empty(),
+        Optional.empty(),
+        image.getWidth(),
+        image.getHeight(),
+        timestampMs);
   }
 
   /**
@@ -414,36 +458,231 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
     validateImageProcessingOptions(imageProcessingOptions);
     validateExternalPoseRect(externalPoseRect);
     return processVideoData(
-        image, imageProcessingOptions, Optional.of(externalPoseRect), timestampMs);
+        image,
+        imageProcessingOptions,
+        Optional.of(externalPoseRect),
+        Optional.empty(),
+        image.getWidth(),
+        image.getHeight(),
+        timestampMs);
+  }
+
+  /**
+   * Performs tracked pose landmark detection on an image whose ROI was already cropped by the
+   * caller.
+   *
+   * <p>A full-image tracking sentinel keeps the pose detector gate closed while making landmark
+   * preprocessing consume the complete supplied image. Returned image landmarks and next-frame
+   * rectangles therefore remain in this cropped image's coordinate system and must be remapped by
+   * the caller.
+   */
+  public PoseLandmarkerResult detectForVideoWithExternalRoiCrop(MPImage image, long timestampMs) {
+    return processVideoData(
+        image,
+        ImageProcessingOptions.builder().build(),
+        Optional.of(FULL_IMAGE_TRACKING_RECT),
+        Optional.empty(),
+        image.getWidth(),
+        image.getHeight(),
+        timestampMs);
+  }
+
+  /**
+   * Performs tracked pose landmark detection on an application-cropped image while preserving
+   * MediaPipe's source-space landmark projection and temporal smoothing.
+   *
+   * <p>The full-image tracking sentinel prevents a second image crop. The source projection
+   * rectangle and dimensions are used only after inference, for landmark/world-landmark
+   * projection, next-frame ROI construction, and MediaPipe's existing smoothing calculators.
+   */
+  public PoseLandmarkerResult detectForVideoWithExternalRoiCrop(
+      MPImage image,
+      NormalizedRect sourceProjectionRect,
+      int sourceImageWidth,
+      int sourceImageHeight,
+      long timestampMs) {
+    validateExternalPoseRect(sourceProjectionRect);
+    validateSourceImageDimensions(sourceImageWidth, sourceImageHeight);
+    return processVideoData(
+        image,
+        ImageProcessingOptions.builder().build(),
+        Optional.of(FULL_IMAGE_TRACKING_RECT),
+        Optional.of(sourceProjectionRect),
+        sourceImageWidth,
+        sourceImageHeight,
+        timestampMs);
+  }
+
+  /** Performs pose landmark detection directly from an application-owned OpenGL texture. */
+  public PoseLandmarkerResult detectForVideo(TextureFrame image, long timestampMs) {
+    return processVideoTextureData(
+        image,
+        Optional.empty(),
+        Optional.empty(),
+        /* sourceImageWidth= */ 0,
+        /* sourceImageHeight= */ 0,
+        timestampMs);
+  }
+
+  /** Performs pose landmark detection from a texture using an externally supplied tracking ROI. */
+  public PoseLandmarkerResult detectForVideo(
+      TextureFrame image, NormalizedRect externalPoseRect, long timestampMs) {
+    validateExternalPoseRect(externalPoseRect);
+    return processVideoTextureData(
+        image,
+        Optional.of(externalPoseRect),
+        Optional.empty(),
+        /* sourceImageWidth= */ 0,
+        /* sourceImageHeight= */ 0,
+        timestampMs);
+  }
+
+  /**
+   * Texture counterpart to {@link #detectForVideoWithExternalRoiCrop(MPImage, long)}.
+   *
+   * <p>The texture must already contain the rotated ROI expanded to its full dimensions.
+   */
+  public PoseLandmarkerResult detectForVideoWithExternalRoiCrop(
+      TextureFrame image, long timestampMs) {
+    return processVideoTextureData(
+        image,
+        Optional.of(FULL_IMAGE_TRACKING_RECT),
+        Optional.empty(),
+        /* sourceImageWidth= */ 0,
+        /* sourceImageHeight= */ 0,
+        timestampMs);
+  }
+
+  /** Texture counterpart that preserves source-space projection and smoothing. */
+  public PoseLandmarkerResult detectForVideoWithExternalRoiCrop(
+      TextureFrame image,
+      NormalizedRect sourceProjectionRect,
+      int sourceImageWidth,
+      int sourceImageHeight,
+      long timestampMs) {
+    validateExternalPoseRect(sourceProjectionRect);
+    validateSourceImageDimensions(sourceImageWidth, sourceImageHeight);
+    return processVideoTextureData(
+        image,
+        Optional.of(FULL_IMAGE_TRACKING_RECT),
+        Optional.of(sourceProjectionRect),
+        sourceImageWidth,
+        sourceImageHeight,
+        timestampMs);
   }
 
   private PoseLandmarkerResult processVideoData(
       MPImage image,
       ImageProcessingOptions imageProcessingOptions,
       Optional<NormalizedRect> externalPoseRect,
+      Optional<NormalizedRect> externalSourceProjectionRect,
+      int sourceImageWidth,
+      int sourceImageHeight,
+      long timestampMs) {
+    RectProto.NormalizedRect imageRect = convertToNormalizedRect(imageProcessingOptions, image);
+    Packet imagePacket = runner.getPacketCreator().createImage(image);
+    return processVideoPackets(
+        imagePacket,
+        imageRect,
+        externalPoseRect,
+        externalSourceProjectionRect,
+        sourceImageWidth,
+        sourceImageHeight,
+        timestampMs);
+  }
+
+  private PoseLandmarkerResult processVideoTextureData(
+      TextureFrame image,
+      Optional<NormalizedRect> externalPoseRect,
+      Optional<NormalizedRect> externalSourceProjectionRect,
+      int sourceImageWidth,
+      int sourceImageHeight,
+      long timestampMs) {
+    if (image == null) {
+      throw new IllegalArgumentException("The GPU texture frame must not be null.");
+    }
+    if (image.getWidth() <= 0 || image.getHeight() <= 0) {
+      image.release();
+      throw new IllegalArgumentException("The GPU texture frame must have positive dimensions.");
+    }
+    if (!externalSourceProjectionRect.isPresent()) {
+      sourceImageWidth = image.getWidth();
+      sourceImageHeight = image.getHeight();
+    }
+    RectProto.NormalizedRect fullImageRect = FULL_IMAGE_TRACKING_RECT.toProto();
+    Packet imagePacket;
+    try {
+      imagePacket = runner.getPacketCreator().createImage(image);
+    } catch (RuntimeException creationFailure) {
+      image.release();
+      throw creationFailure;
+    }
+    return processVideoPackets(
+        imagePacket,
+        fullImageRect,
+        externalPoseRect,
+        externalSourceProjectionRect,
+        sourceImageWidth,
+        sourceImageHeight,
+        timestampMs);
+  }
+
+  private PoseLandmarkerResult processVideoPackets(
+      Packet imagePacket,
+      RectProto.NormalizedRect imageRect,
+      Optional<NormalizedRect> externalPoseRect,
+      Optional<NormalizedRect> externalSourceProjectionRect,
+      int sourceImageWidth,
+      int sourceImageHeight,
       long timestampMs) {
     Map<String, Packet> inputPackets = new HashMap<>();
-    inputPackets.put(IMAGE_IN_STREAM_NAME, runner.getPacketCreator().createImage(image));
-    inputPackets.put(
-        NORM_RECT_IN_STREAM_NAME,
-        runner
-            .getPacketCreator()
-            .createProto(convertToNormalizedRect(imageProcessingOptions, image)));
-    inputPackets.put(
-        EXTERNAL_POSE_RECT_IN_STREAM_NAME,
-        runner
-            .getPacketCreator()
-            .createProto(
-                externalPoseRect
-                    .orElseGet(() -> NormalizedRect.create(0.5f, 0.5f, 1.0f, 1.0f, 0.0f))
-                    .toProto()));
-    inputPackets.put(
-        USE_EXTERNAL_POSE_RECT_IN_STREAM_NAME,
-        runner.getPacketCreator().createBool(externalPoseRect.isPresent()));
-    inputPackets.put(
-        RESET_TRACKING_IN_STREAM_NAME,
-        runner.getPacketCreator().createBool(resetTrackingPending.getAndSet(false)));
-    return (PoseLandmarkerResult) super.processVideoData(inputPackets, timestampMs);
+    inputPackets.put(IMAGE_IN_STREAM_NAME, imagePacket);
+    try {
+      inputPackets.put(
+          NORM_RECT_IN_STREAM_NAME, runner.getPacketCreator().createProto(imageRect));
+      inputPackets.put(
+          EXTERNAL_POSE_RECT_IN_STREAM_NAME,
+          runner
+              .getPacketCreator()
+              .createProto(externalPoseRect.orElse(FULL_IMAGE_TRACKING_RECT).toProto()));
+      inputPackets.put(
+          USE_EXTERNAL_POSE_RECT_IN_STREAM_NAME,
+          runner.getPacketCreator().createBool(externalPoseRect.isPresent()));
+      inputPackets.put(
+          EXTERNAL_SOURCE_PROJECTION_RECT_IN_STREAM_NAME,
+          runner
+              .getPacketCreator()
+              .createProto(
+                  externalSourceProjectionRect.orElse(FULL_IMAGE_TRACKING_RECT).toProto()));
+      inputPackets.put(
+          EXTERNAL_SOURCE_IMAGE_SIZE_IN_STREAM_NAME,
+          runner.getPacketCreator().createInt32Pair(sourceImageWidth, sourceImageHeight));
+      inputPackets.put(
+          USE_EXTERNAL_SOURCE_PROJECTION_IN_STREAM_NAME,
+          runner.getPacketCreator().createBool(externalSourceProjectionRect.isPresent()));
+      inputPackets.put(
+          RESET_TRACKING_IN_STREAM_NAME,
+          runner.getPacketCreator().createBool(resetTrackingPending.getAndSet(false)));
+      PoseLandmarkerResult result =
+          (PoseLandmarkerResult) super.processVideoData(inputPackets, timestampMs);
+      if (result == null) {
+        throw new MediaPipeException(
+            MediaPipeException.StatusCode.INTERNAL.ordinal(),
+            "Pose landmarker graph produced no synchronized output for timestampMs="
+                + timestampMs
+                + ", externalSourceProjection="
+                + externalSourceProjectionRect.isPresent());
+      }
+      return result;
+    } finally {
+      // TaskRunner nulls packets transferred into the graph and releases packets it could not
+      // transfer. Packet.release() is idempotent, so this also covers failures before addPackets.
+      for (Packet packet : inputPackets.values()) {
+        if (packet != null) {
+          packet.release();
+        }
+      }
+    }
   }
 
   private static void validateExternalPoseRect(NormalizedRect rect) {
@@ -457,6 +696,12 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
         || rect.height() <= 0.0f) {
       throw new IllegalArgumentException(
           "External pose rectangle values must be finite and its width and height must be positive.");
+    }
+  }
+
+  private static void validateSourceImageDimensions(int width, int height) {
+    if (width <= 0 || height <= 0) {
+      throw new IllegalArgumentException("Source image dimensions must be positive.");
     }
   }
 
