@@ -16,7 +16,6 @@ limitations under the License.
 #include <optional>
 #include <utility>
 #include <vector>
-
 #include "absl/status/status.h"
 #include "mediapipe/calculators/core/clip_vector_size_calculator.pb.h"
 #include "mediapipe/calculators/core/gate_calculator.pb.h"
