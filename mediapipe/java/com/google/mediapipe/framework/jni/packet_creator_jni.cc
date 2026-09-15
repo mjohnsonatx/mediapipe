@@ -23,6 +23,7 @@
 #include <type_traits>
 #include <utility>
 
+#include "absl/cleanup/cleanup.h"
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
 #include "mediapipe/framework/calculator.pb.h"
@@ -99,6 +100,20 @@ absl::StatusOr<mediapipe::GpuBuffer> CreateGpuBuffer(
       << "Cannot create a mediapipe::GpuBuffer packet on a "
          "graph without GPU support";
 
+  const auto gpu_buffer_format = mediapipe::GpuBufferFormatForGlFormat(format);
+  if (gpu_buffer_format == mediapipe::GpuBufferFormat::kUnknown) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("Unsupported OpenGL texture format: ", format));
+  }
+  ABSL_ASSIGN_OR_RETURN(WrapExternalGlTextureSyncMode wrap_sync_mode,
+                        ParseSyncMode(sync_mode));
+
+  jobject java_callback = nullptr;
+  jobject packet_creator = nullptr;
+  absl::Cleanup cleanup_refs = [&] {
+    if (java_callback) env->DeleteGlobalRef(java_callback);
+    if (packet_creator) env->DeleteGlobalRef(packet_creator);
+  };
   mediapipe::GlTextureBuffer::DeletionCallback cc_callback;
   if (texture_release_callback) {
     // TODO: see if this can be cached.
@@ -106,16 +121,19 @@ absl::StatusOr<mediapipe::GpuBuffer> CreateGpuBuffer(
     // subclass of PacketCreator, and the method is private.
     jclass my_class =
         env->FindClass("com/google/mediapipe/framework/PacketCreator");
+    RET_CHECK(my_class);
     jmethodID release_method =
         env->GetMethodID(my_class, "releaseWithSyncToken",
                          "(JL"
                          "com/google/mediapipe/framework/TextureReleaseCallback"
                          ";)V");
-    RET_CHECK(release_method);
     env->DeleteLocalRef(my_class);
+    RET_CHECK(release_method);
 
-    jobject java_callback = env->NewGlobalRef(texture_release_callback);
-    jobject packet_creator = env->NewGlobalRef(thiz);
+    java_callback = env->NewGlobalRef(texture_release_callback);
+    RET_CHECK(java_callback);
+    packet_creator = env->NewGlobalRef(thiz);
+    RET_CHECK(packet_creator);
     cc_callback = [packet_creator, release_method,
                    java_callback](mediapipe::GlSyncToken release_token) {
       JNIEnv* env = mediapipe::java::GetJNIEnv();
@@ -132,19 +150,15 @@ absl::StatusOr<mediapipe::GpuBuffer> CreateGpuBuffer(
     };
   }
 
-  mediapipe::GpuBufferFormat gpu_buffer_format =
-      mediapipe::GpuBufferFormatForGlFormat(format);
-  if (gpu_buffer_format == mediapipe::GpuBufferFormat::kUnknown) {
-    return absl::InvalidArgumentError(
-        absl::StrCat("Unsupported OpenGL texture format: ", format));
-  }
-
-  ABSL_ASSIGN_OR_RETURN(WrapExternalGlTextureSyncMode wrap_sync_mode,
-                        ParseSyncMode(sync_mode));
-
-  return WrapExternalGlTexture(*gpu_resources, GL_TEXTURE_2D, name, width,
-                               height, gpu_buffer_format,
-                               std::move(cc_callback), wrap_sync_mode);
+  ABSL_ASSIGN_OR_RETURN(
+      auto buffer,
+      WrapExternalGlTexture(*gpu_resources, GL_TEXTURE_2D, name, width, height,
+                            gpu_buffer_format, std::move(cc_callback),
+                            wrap_sync_mode));
+  // Successful wrapping transfers the references to the release callback. On
+  // failure only the references are cleaned up; Java still owns the frame.
+  std::move(cleanup_refs).Cancel();
+  return buffer;
 }
 #endif  // !MEDIAPIPE_DISABLE_GPU
 
@@ -473,8 +487,21 @@ JNIEXPORT jlong JNICALL PACKET_CREATOR_METHOD(nativeCreateGpuImage)(
     jint height, jint format, jobject texture_release_callback) {
   auto buffer_or =
       CreateGpuBuffer(env, thiz, context, name, width, height, format,
-                      texture_release_callback, /*sync_mode=*/0);
-  if (ThrowIfError(env, buffer_or.status())) return 0L;
+                      texture_release_callback, /*sync_mode=*/1);
+  // Preserve pending JNI lookup/allocation exceptions after reference cleanup.
+  if (env->ExceptionCheck()) return 0L;
+  // The caller may already have queued a wait for a capture-context fence. The
+  // new producer fence extends that dependency to every graph read context.
+  if (!buffer_or.ok()) {
+    ThrowIfError(
+        env, absl::Status(buffer_or.status().code(),
+                          absl::StrCat("nativeCreateGpuImage: texture=", name,
+                                       ", size=", width, "x", height,
+                                       ", format=", format,
+                                       ", required producer fence: ",
+                                       buffer_or.status().message())));
+    return 0L;
+  }
   mediapipe::Packet packet =
       mediapipe::MakePacket<mediapipe::Image>(std::move(buffer_or).value());
   return CreatePacketWithContext(context, packet);
@@ -486,6 +513,7 @@ JNIEXPORT jlong JNICALL PACKET_CREATOR_METHOD(nativeCreateGpuBuffer)(
     jint sync_mode) {
   auto buffer_or = CreateGpuBuffer(env, thiz, context, name, width, height,
                                    format, texture_release_callback, sync_mode);
+  if (env->ExceptionCheck()) return 0L;
   if (ThrowIfError(env, buffer_or.status())) return 0L;
   mediapipe::Packet packet =
       mediapipe::MakePacket<mediapipe::GpuBuffer>(std::move(buffer_or).value());

@@ -1,0 +1,58 @@
+{
+  "status": "MediaPipe native handoff; Android AAR release integration pending",
+  "date": "2026-09-15",
+  "baseCommit": "e1020198fd44211983d7c6695b8aff5a41a8ef4b",
+  "branch": "BUG-GPU-desynch-identified",
+  "sourceState": "modified-from-base",
+  "bazelVersion": "7.7.0",
+  "ndkVersion": "28.2.13676358",
+  "buildFlags": "-c opt --config=android_arm64 --strip=always --jobs=2 --repo_env=HERMETIC_PYTHON_VERSION=3.12",
+  "sourcesSha256": {
+    "mediapipe/gpu/BUILD": "a783c70839dc5564696f3f946b2444ff5514d7b0682e5831ddcdf5e90f2623ed",
+    "mediapipe/gpu/gl_app_texture_support.cc": "f37d20dd0ba08c38ab09b04563235c454a1de4c0d54f4e539ca3641bec8b0c05",
+    "mediapipe/gpu/gl_app_texture_support.h": "77a8622bc0b538a9adb2b33972e1f8d73e00167f870976effaaa5851d8d9e14e",
+    "mediapipe/gpu/gl_app_texture_support_test.cc": "414deb0dcb396a23205c242b2632a3210e5640b2775592511c58c2ec654ca73e",
+    "mediapipe/gpu/gl_context.cc": "b2ef8446a3850212b34f3c26141f344db2eda9d4cc4a3973158b991694c76209",
+    "mediapipe/gpu/gl_context.h": "fd53f8253491de765431651ef795e94838e1438e132654833ce8becc50f5fe6e",
+    "mediapipe/java/com/google/mediapipe/framework/PacketCreator.java": "066b480692ae5d942b848211e53a16b821c1e5becf53fbfd08784ab2d5c87047",
+    "mediapipe/java/com/google/mediapipe/framework/jni/BUILD": "eff07f144cc4d9afcfae42526f525e20f15493d07c8d5f3acc97051bcc8010f8",
+    "mediapipe/java/com/google/mediapipe/framework/jni/packet_creator_jni.cc": "054cd00994ce01dcb41e59cae739881fd017226e3cff1f740d796916d6e7e96b"
+  },
+  "nativeLibrary": {
+    "path": "bazel-bin/mediapipe/tasks/java/com/google/mediapipe/tasks/vision/libmediapipe_tasks_jni.so",
+    "sha256": "2b3a32c9afc92c78e5a7a408fd21e8dbf802a16fc6028f17310251be632a0438"
+  },
+  "nativeTest": {
+    "path": "bazel-bin/mediapipe/gpu/gl_app_texture_support_test",
+    "sha256": "90eeb598af71e2f034e04e7a3240a890f7cea90c9c8770be7bd173ae1e8c099e",
+    "device": "Pixel 9 Pro",
+    "androidVersion": "16",
+    "renderer": "Mali-G715",
+    "glVersion": "OpenGL ES 3.2 v1.r54p2-00eac0.7001668a7a05889fc53765c682b36a3f",
+    "tests": 7,
+    "failures": 0,
+    "frames": 64,
+    "evidenceDirectory": "/tmp/mediapipe-texture-sync-tftvl283"
+  },
+  "nativeGpuImageDisassembly": {
+    "entry": "0x556268",
+    "setRequiredSync": "0x556280: mov w9, #0x1",
+    "passSyncArgument": "0x5562a4: str w9, [sp]"
+  },
+  "requiredSharedGlExportsVerified": [
+    "Java_com_google_mediapipe_framework_Graph_nativeSetParentGlContext",
+    "Java_com_google_mediapipe_framework_GraphGlSyncToken_nativeWaitOnCpu",
+    "Java_com_google_mediapipe_framework_GraphGlSyncToken_nativeWaitOnGpu",
+    "Java_com_google_mediapipe_framework_GraphGlSyncToken_nativeRelease",
+    "Java_com_google_mediapipe_framework_GraphTextureFrame_nativeReleaseBuffer",
+    "Java_com_google_mediapipe_framework_GraphTextureFrame_nativeGetTextureName",
+    "Java_com_google_mediapipe_framework_GraphTextureFrame_nativeGetWidth",
+    "Java_com_google_mediapipe_framework_GraphTextureFrame_nativeGetHeight",
+    "Java_com_google_mediapipe_framework_GraphTextureFrame_nativeGetFormat",
+    "Java_com_google_mediapipe_framework_GraphTextureFrame_nativeGpuWait",
+    "Java_com_google_mediapipe_framework_GraphTextureFrame_nativeCreateSyncTokenForCurrentExternalContext",
+    "Java_com_google_mediapipe_framework_GraphTextureFrame_nativeGetCurrentExternalContextHandle",
+    "Java_com_google_mediapipe_framework_GraphTextureFrame_nativeDidRead"
+  ],
+  "packagedAarsUpdated": false
+}

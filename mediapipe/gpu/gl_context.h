@@ -329,6 +329,14 @@ class GlContext : public std::enable_shared_from_this<GlContext> {
   static std::shared_ptr<GlSyncPoint> CreateSyncTokenForCurrentExternalContext(
       const std::shared_ptr<GlContext>& delegate_graph_context);
 
+  // Creates and flushes a fence on the calling context, after any queued GPU
+  // waits. The delegate must share objects with that context and remain usable
+  // for fence deletion. Returns an error for missing contexts, unsupported
+  // fences, or fence creation failure; never falls back to glFinish or a CPU wait.
+  static absl::StatusOr<std::shared_ptr<GlSyncPoint>>
+  CreateFenceSyncTokenForCurrentExternalContext(
+      const std::shared_ptr<GlContext>& delegate_graph_context);
+
   // These are used for testing specific SyncToken implementations. Do not use
   // outside of tests.
   enum class SyncTokenTypeForTest {

@@ -742,6 +742,42 @@ cc_library(
     ],
 )
 
+cc_test(
+    name = "gl_app_texture_support_test",
+    size = "medium",
+    srcs = ["gl_app_texture_support_test.cc"],
+    # EGL native test, also runnable as an arm64 executable through adb.
+    # Link production objects here so the GL wrappers audit their calls too.
+    linkstatic = True,
+    linkopts = [
+        "-Wl,--wrap=glFenceSync",
+        "-Wl,--wrap=glFlush",
+        "-Wl,--wrap=glFinish",
+        "-Wl,--wrap=glWaitSync",
+        "-Wl,--wrap=glClientWaitSync",
+        "-Wl,--wrap=glGetString",
+    ],
+    target_compatible_with = select({
+        "//mediapipe:apple": ["@platforms//:incompatible"],
+        "//mediapipe:emscripten": ["@platforms//:incompatible"],
+        "@platforms//os:windows": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
+    deps = [
+        ":gl_app_texture_support",
+        ":gl_base",
+        ":gl_context",
+        ":gl_texture_util",
+        ":gl_texture_view",
+        ":gpu_shared_data_internal",
+        ":shader_util",
+        "//mediapipe/framework/formats:image",
+        "//mediapipe/framework/port:gtest_main",
+        "//mediapipe/framework/port:status_matchers",
+        "@com_google_absl//absl/status",
+    ],
+)
+
 mediapipe_proto_library(
     name = "gl_context_options_proto",
     srcs = ["gl_context_options.proto"],

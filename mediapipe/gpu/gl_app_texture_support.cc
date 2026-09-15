@@ -57,18 +57,29 @@ absl::StatusOr<GpuBuffer> WrapExternalGlTexture(
     GlTextureBuffer::DeletionCallback release_callback,
     WrapExternalGlTextureSyncMode sync_mode) {
   auto& gl_context = gpu_resources.gl_context();
-  auto buffer = GlTextureBuffer::Wrap(target, name, width, height, format,
-                                      gl_context, release_callback);
-
-  if (sync_mode == WrapExternalGlTextureSyncMode::kNoSync) {
-    return GpuBuffer(std::move(buffer));
+  std::shared_ptr<GlSyncPoint> sync;
+  switch (sync_mode) {
+    case WrapExternalGlTextureSyncMode::kNoSync:
+      break;
+    case WrapExternalGlTextureSyncMode::kSync: {
+      ABSL_ASSIGN_OR_RETURN(
+          sync,
+          GlContext::CreateFenceSyncTokenForCurrentExternalContext(gl_context));
+      break;
+    }
+    case WrapExternalGlTextureSyncMode::kMaybeSyncOrFinish:
+      sync = GlContext::CreateSyncTokenForCurrentExternalContext(gl_context);
+      break;
+    default:
+      return absl::InvalidArgumentError("Unknown external texture sync mode.");
   }
-
-  auto sync = GlContext::CreateSyncTokenForCurrentExternalContext(gl_context);
+  // Transfer ownership only after synchronization succeeds. On error the caller
+  // still owns the texture and must release it; invoking its callback as well
+  // would return a reusable texture lease twice.
+  auto buffer = GlTextureBuffer::Wrap(target, name, width, height, format,
+                                      gl_context, std::move(release_callback));
   if (sync) {
-    buffer->Updated(sync);
-  } else if (sync_mode == WrapExternalGlTextureSyncMode::kSync) {
-    return absl::InternalError("Failed to create a sync.");
+    buffer->Updated(std::move(sync));
   }
   return GpuBuffer(std::move(buffer));
 }

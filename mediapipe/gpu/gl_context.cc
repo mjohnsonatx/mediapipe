@@ -846,6 +846,8 @@ class GlExternalFenceSyncPoint : public GlSyncPoint {
   GlExternalFenceSyncPoint(const GlExternalFenceSyncPoint&) = delete;
   GlExternalFenceSyncPoint& operator=(const GlExternalFenceSyncPoint&) = delete;
 
+  bool HasFence() const { return sync_ != nullptr; }
+
   void Wait() override {
     // TODO: can we assume this is always called with a GLContext being current?
     sync_.Wait();
@@ -972,6 +974,58 @@ GlContext::CreateSyncTokenForCurrentExternalContext(
     glFinish();
     return nullptr;
   }
+}
+
+absl::StatusOr<std::shared_ptr<GlSyncPoint>>
+GlContext::CreateFenceSyncTokenForCurrentExternalContext(
+    const std::shared_ptr<GlContext>& delegate_graph_context) {
+  if (!delegate_graph_context) {
+    return absl::InvalidArgumentError(
+        "External texture sync requires a graph GL context.");
+  }
+  if (!IsAnyContextCurrent()) {
+    return absl::FailedPreconditionError(
+        "External texture sync requires a current calling GL context.");
+  }
+#ifdef __EMSCRIPTEN__
+  return absl::UnimplementedError(
+      "External texture fence synchronization is not supported by WebGL.");
+#else
+#ifdef GL_ES_VERSION_2_0
+  constexpr internal_gl_context::OpenGlVersion kMinFenceVersion = {3, 0};
+#else
+  constexpr internal_gl_context::OpenGlVersion kMinFenceVersion = {3, 2};
+#endif
+  if (!delegate_graph_context->ShouldUseFenceSync() ||
+      !SymbolAvailable(&glFenceSync) || !SymbolAvailable(&glDeleteSync) ||
+      !internal_gl_context::IsOpenGlVersionSameOrAbove(
+          {delegate_graph_context->gl_major_version(),
+           delegate_graph_context->gl_minor_version()},
+          kMinFenceVersion)) {
+    return absl::UnimplementedError(
+        "External texture sync requires GL fence support on the graph context.");
+  }
+  // Sharing texture objects does not imply the contexts have the same version.
+  // Query the caller without issuing unsupported ES3 queries on ES2.
+  const auto* version = reinterpret_cast<const char*>(glGetString(GL_VERSION));
+  GLint major = 0;
+  GLint minor = 0;
+  if (!version || !ParseGlVersion(version, &major, &minor) ||
+      !internal_gl_context::IsOpenGlVersionSameOrAbove({major, minor},
+                                                     kMinFenceVersion)) {
+    return absl::UnimplementedError(absl::StrFormat(
+        "External texture sync requires core GL fences on the calling context; "
+        "GL_VERSION=%s",
+        version ? version : "unavailable"));
+  }
+  auto sync = std::make_shared<GlExternalFenceSyncPoint>(delegate_graph_context);
+  if (!sync->HasFence()) {
+    return absl::InternalError(absl::StrFormat(
+        "External texture glFenceSync returned null; GL error=0x%x",
+        glGetError()));
+  }
+  return std::shared_ptr<GlSyncPoint>(std::move(sync));
+#endif
 }
 
 std::shared_ptr<GlSyncPoint> GlContext::TestOnly_CreateSpecificSyncToken(

@@ -105,7 +105,8 @@ enum class WrapExternalGlTextureSyncMode {
   // for both external textures and MediaPipe graph.
   kNoSync,
   // MediaPipe graph has a dedicated GL context(s) and external texture must be
-  // efficiently synchronized using GL sync object.
+  // synchronized using a GL fence on the calling context. Missing/unsupported
+  // contexts or failed fence creation return an error without calling glFinish.
   kSync,
   // MediaPipe graph has a dedicated GL context(s) and external texture can be
   // synchronized using GL sync object or glFinish or can be skipped
@@ -132,6 +133,8 @@ enum class WrapExternalGlTextureSyncMode {
 //
 // NOTE: returns GpuBuffer which can be wrapped into a packet as
 //   `MakePacket<GpuBuffer>(std::move(gpu_buffer))`.
+// Ownership transfers only on success. On error, release_callback is not called
+// and the caller remains responsible for the texture.
 absl::StatusOr<GpuBuffer> WrapExternalGlTexture(
     const GpuResources& gpu_resources, GLenum target, GLuint name, int width,
     int height, GpuBufferFormat format,

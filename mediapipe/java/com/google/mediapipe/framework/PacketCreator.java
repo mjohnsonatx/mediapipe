@@ -35,7 +35,8 @@ public class PacketCreator {
     // for both external textures and MediaPipe graph.
     NO_SYNC(0),
     // MediaPipe graph has a dedicated GL context(s) and external texture must be
-    // efficiently synchronized using GL sync object.
+    // synchronized using a GL fence on the calling context. Throws if a fence
+    // cannot be created; never falls back to glFinish.
     SYNC(1),
     // MediaPipe graph has a dedicated GL context(s) and external texture can be
     // synchronized using GL sync object or glFinish or can be skipped
@@ -339,6 +340,8 @@ public class PacketCreator {
   /**
    * Creates a mediapipe::GpuBuffer with the specified texture name, dimensions, and format.
    *
+   * <p>On creation failure the callback is not invoked; the caller still owns the texture.
+   *
    * @param name the OpenGL texture name.
    * @param width the width in pixels.
    * @param height the height in pixels.
@@ -416,6 +419,8 @@ public class PacketCreator {
   /**
    * Creates a mediapipe::GpuBuffer with the provided {@link TextureFrame}.
    *
+   * <p>Ownership transfers only on success; the caller must release the frame if creation throws.
+   *
    * <p>Note: in order for MediaPipe to be able to access the texture, the application's GL context
    * must be linked with MediaPipe's. This is ensured by calling {@link
    * Graph#createGlRunner(String,long)} with the native handle to the application's GL context as
@@ -443,6 +448,11 @@ public class PacketCreator {
 
   /**
    * Creates a mediapipe::Image with the provided {@link TextureFrame}.
+   *
+   * <p>The calling GL context must be current and support GL fences. A producer fence is
+   * inserted after its pending commands (including GPU waits) so graph contexts wait before
+   * reading the texture. Synchronization failure throws without a CPU wait. Ownership transfers
+   * only on success; the caller must release the frame if creation throws.
    *
    * <p>Note: in order for MediaPipe to be able to access the texture, the application's GL context
    * must be linked with MediaPipe's. This is ensured by calling {@link
