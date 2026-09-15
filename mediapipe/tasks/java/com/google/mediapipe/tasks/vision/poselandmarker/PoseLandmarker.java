@@ -38,6 +38,8 @@ import com.google.mediapipe.tasks.core.OutputHandler.ResultListener;
 import com.google.mediapipe.tasks.core.TaskInfo;
 import com.google.mediapipe.tasks.core.TaskOptions;
 import com.google.mediapipe.tasks.core.TaskRunner;
+import com.google.mediapipe.tasks.core.TaskResult;
+import com.google.mediapipe.tasks.vision.poselandmarker.PoseLandmarkerResult.LandmarksOnlyResult;
 import com.google.mediapipe.tasks.core.proto.BaseOptionsProto;
 import com.google.mediapipe.tasks.vision.core.BaseVisionTaskApi;
 import com.google.mediapipe.tasks.vision.core.ImageProcessingOptions;
@@ -104,7 +106,6 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
   private static final int IMAGE_OUT_STREAM_INDEX = 2;
   private static final int POSE_RECTS_NEXT_FRAME_OUT_STREAM_INDEX = 3;
   private static final int POSE_DETECTIONS_OUT_STREAM_INDEX = 4;
-  private static int segmentationMasksOutStreamIndex = -1;
   private static final String TASK_GRAPH_NAME =
       "mediapipe.tasks.vision.pose_landmarker.PoseLandmarkerGraph";
 
@@ -188,6 +189,43 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
 
   private static PoseLandmarker createFromOptionsInternal(
       Context context, PoseLandmarkerOptions landmarkerOptions, long parentGlContext) {
+    return createFromOptionsInternal(context, landmarkerOptions, parentGlContext, false);
+  }
+
+  /** Selects the typed video API backed by a pruned landmarks-only model. */
+  public enum OutputMode { LANDMARKS_ONLY }
+
+  /**
+   * Creates a video landmarker with no mask or presence processing. The model must have the
+   * three-output landmarks-only layout. Existing creation overloads retain the legacy behavior.
+   */
+  public static LandmarksOnly createFromOptions(
+      Context context, PoseLandmarkerOptions options, OutputMode outputMode) {
+    return createLandmarksOnly(context, options, 0L, outputMode);
+  }
+
+  /** Creates a landmarks-only video landmarker sharing the caller's live GL context. */
+  public static LandmarksOnly createFromOptions(
+      Context context, PoseLandmarkerOptions options, long parentGlContext, OutputMode outputMode) {
+    if (parentGlContext == 0L) {
+      throw new IllegalArgumentException("The parent GL context handle must be non-zero.");
+    }
+    return createLandmarksOnly(context, options, parentGlContext, outputMode);
+  }
+
+  private static LandmarksOnly createLandmarksOnly(
+      Context context, PoseLandmarkerOptions options, long parentGlContext, OutputMode outputMode) {
+    if (outputMode != OutputMode.LANDMARKS_ONLY || options.runningMode() != RunningMode.VIDEO
+        || options.outputSegmentationMasks()) {
+      throw new IllegalArgumentException(
+          "Landmarks-only creation requires VIDEO mode with mask output disabled.");
+    }
+    return new LandmarksOnly(createFromOptionsInternal(context, options, parentGlContext, true));
+  }
+
+  private static PoseLandmarker createFromOptionsInternal(
+      Context context, PoseLandmarkerOptions landmarkerOptions, long parentGlContext,
+      boolean landmarksOnly) {
     List<String> inputStreams = new ArrayList<>(BASE_INPUT_STREAMS);
     if (landmarkerOptions.runningMode() == RunningMode.VIDEO) {
       inputStreams.add("EXTERNAL_POSE_RECT:" + EXTERNAL_POSE_RECT_IN_STREAM_NAME);
@@ -209,17 +247,35 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
     outputStreams.add("IMAGE:image_out");
     outputStreams.add("POSE_RECTS_NEXT_FRAME:pose_rects_next_frame");
     outputStreams.add("DETECTIONS:pose_detections");
-    if (landmarkerOptions.outputSegmentationMasks()) {
+    final int segmentationMasksOutStreamIndex = outputStreams.size();
+    if (!landmarksOnly && landmarkerOptions.outputSegmentationMasks()) {
       outputStreams.add("SEGMENTATION_MASK:segmentation_masks");
-      segmentationMasksOutStreamIndex = outputStreams.size() - 1;
     }
 
     // TODO: Consolidate OutputHandler and TaskRunner.
-    OutputHandler<PoseLandmarkerResult, MPImage> handler = new OutputHandler<>();
+    OutputHandler<TaskResult, MPImage> handler = new OutputHandler<>();
     handler.setOutputPacketConverter(
-        new OutputHandler.OutputPacketConverter<PoseLandmarkerResult, MPImage>() {
+        new OutputHandler.OutputPacketConverter<TaskResult, MPImage>() {
           @Override
-          public PoseLandmarkerResult convertToTaskResult(List<Packet> packets) {
+          public TaskResult convertToTaskResult(List<Packet> packets) {
+            if (landmarksOnly) {
+              return LandmarksOnlyResult.create(
+                  packets.get(LANDMARKS_OUT_STREAM_INDEX).isEmpty()
+                      ? Collections.emptyList()
+                      : PacketGetter.getProtoVector(packets.get(LANDMARKS_OUT_STREAM_INDEX),
+                          NormalizedLandmarkList.parser()),
+                  packets.get(WORLD_LANDMARKS_OUT_STREAM_INDEX).isEmpty()
+                      ? Collections.emptyList()
+                      : PacketGetter.getProtoVector(packets.get(WORLD_LANDMARKS_OUT_STREAM_INDEX),
+                          LandmarkList.parser()),
+                  packets.get(POSE_RECTS_NEXT_FRAME_OUT_STREAM_INDEX).isEmpty()
+                      ? Collections.emptyList()
+                      : PacketGetter.getProtoVector(packets.get(POSE_RECTS_NEXT_FRAME_OUT_STREAM_INDEX),
+                          RectProto.NormalizedRect.parser()),
+                  !packets.get(POSE_DETECTIONS_OUT_STREAM_INDEX).isEmpty(),
+                  BaseVisionTaskApi.generateResultTimestampMs(
+                      RunningMode.VIDEO, packets.get(LANDMARKS_OUT_STREAM_INDEX)));
+            }
             // If there is no poses detected in the image, just returns empty lists.
             if (packets.get(LANDMARKS_OUT_STREAM_INDEX).isEmpty()) {
               return PoseLandmarkerResult.create(
@@ -234,7 +290,7 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
             /** Get segmentation masks */
             Optional<List<MPImage>> segmentedMasks = Optional.empty();
             if (landmarkerOptions.outputSegmentationMasks()) {
-              segmentedMasks = getSegmentationMasks(packets);
+              segmentedMasks = getSegmentationMasks(packets, segmentationMasksOutStreamIndex);
             }
 
             return PoseLandmarkerResult.create(
@@ -260,18 +316,26 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
                 .build();
           }
         });
-    landmarkerOptions.resultListener().ifPresent(handler::setResultListener);
+    landmarkerOptions.resultListener().ifPresent(listener ->
+        handler.setResultListener((result, image) ->
+            listener.run((PoseLandmarkerResult) result, image)));
     landmarkerOptions.errorListener().ifPresent(handler::setErrorListener);
     TaskRunner runner =
         TaskRunner.create(
             context,
-            TaskInfo.<PoseLandmarkerOptions>builder()
+            TaskInfo.<TaskOptions>builder()
                 .setTaskName(PoseLandmarker.class.getSimpleName())
                 .setTaskRunningModeName(landmarkerOptions.runningMode().name())
-                .setTaskGraphName(TASK_GRAPH_NAME)
+                .setTaskGraphName(landmarksOnly
+                    ? "mediapipe.tasks.vision.pose_landmarker.PoseLandmarkerLandmarksOnlyGraph"
+                    : TASK_GRAPH_NAME)
                 .setInputStreams(inputStreams)
                 .setOutputStreams(outputStreams)
-                .setTaskOptions(landmarkerOptions)
+                .setTaskOptions(landmarksOnly ? new TaskOptions() {
+                  @Override public CalculatorOptions convertToCalculatorOptionsProto() {
+                    return landmarkerOptions.convertToCalculatorOptionsProto(true);
+                  }
+                } : landmarkerOptions)
                 .setEnableFlowLimiting(landmarkerOptions.runningMode() == RunningMode.LIVE_STREAM)
                 .build(),
             handler,
@@ -405,7 +469,7 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
   public PoseLandmarkerResult detectForVideo(
       MPImage image, ImageProcessingOptions imageProcessingOptions, long timestampMs) {
     validateImageProcessingOptions(imageProcessingOptions);
-    return processVideoData(
+    return (PoseLandmarkerResult) processVideoData(
         image,
         imageProcessingOptions,
         Optional.empty(),
@@ -457,7 +521,7 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
       long timestampMs) {
     validateImageProcessingOptions(imageProcessingOptions);
     validateExternalPoseRect(externalPoseRect);
-    return processVideoData(
+    return (PoseLandmarkerResult) processVideoData(
         image,
         imageProcessingOptions,
         Optional.of(externalPoseRect),
@@ -477,7 +541,7 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
    * the caller.
    */
   public PoseLandmarkerResult detectForVideoWithExternalRoiCrop(MPImage image, long timestampMs) {
-    return processVideoData(
+    return (PoseLandmarkerResult) processVideoData(
         image,
         ImageProcessingOptions.builder().build(),
         Optional.of(FULL_IMAGE_TRACKING_RECT),
@@ -503,7 +567,7 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
       long timestampMs) {
     validateExternalPoseRect(sourceProjectionRect);
     validateSourceImageDimensions(sourceImageWidth, sourceImageHeight);
-    return processVideoData(
+    return (PoseLandmarkerResult) processVideoData(
         image,
         ImageProcessingOptions.builder().build(),
         Optional.of(FULL_IMAGE_TRACKING_RECT),
@@ -515,7 +579,7 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
 
   /** Performs pose landmark detection directly from an application-owned OpenGL texture. */
   public PoseLandmarkerResult detectForVideo(TextureFrame image, long timestampMs) {
-    return processVideoTextureData(
+    return (PoseLandmarkerResult) processVideoTextureData(
         image,
         Optional.empty(),
         Optional.empty(),
@@ -528,7 +592,7 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
   public PoseLandmarkerResult detectForVideo(
       TextureFrame image, NormalizedRect externalPoseRect, long timestampMs) {
     validateExternalPoseRect(externalPoseRect);
-    return processVideoTextureData(
+    return (PoseLandmarkerResult) processVideoTextureData(
         image,
         Optional.of(externalPoseRect),
         Optional.empty(),
@@ -544,7 +608,7 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
    */
   public PoseLandmarkerResult detectForVideoWithExternalRoiCrop(
       TextureFrame image, long timestampMs) {
-    return processVideoTextureData(
+    return (PoseLandmarkerResult) processVideoTextureData(
         image,
         Optional.of(FULL_IMAGE_TRACKING_RECT),
         Optional.empty(),
@@ -562,7 +626,7 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
       long timestampMs) {
     validateExternalPoseRect(sourceProjectionRect);
     validateSourceImageDimensions(sourceImageWidth, sourceImageHeight);
-    return processVideoTextureData(
+    return (PoseLandmarkerResult) processVideoTextureData(
         image,
         Optional.of(FULL_IMAGE_TRACKING_RECT),
         Optional.of(sourceProjectionRect),
@@ -571,7 +635,7 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
         timestampMs);
   }
 
-  private PoseLandmarkerResult processVideoData(
+  private TaskResult processVideoData(
       MPImage image,
       ImageProcessingOptions imageProcessingOptions,
       Optional<NormalizedRect> externalPoseRect,
@@ -591,7 +655,7 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
         timestampMs);
   }
 
-  private PoseLandmarkerResult processVideoTextureData(
+  private TaskResult processVideoTextureData(
       TextureFrame image,
       Optional<NormalizedRect> externalPoseRect,
       Optional<NormalizedRect> externalSourceProjectionRect,
@@ -627,7 +691,7 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
         timestampMs);
   }
 
-  private PoseLandmarkerResult processVideoPackets(
+  private TaskResult processVideoPackets(
       Packet imagePacket,
       RectProto.NormalizedRect imageRect,
       Optional<NormalizedRect> externalPoseRect,
@@ -663,8 +727,7 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
       inputPackets.put(
           RESET_TRACKING_IN_STREAM_NAME,
           runner.getPacketCreator().createBool(resetTrackingPending.getAndSet(false)));
-      PoseLandmarkerResult result =
-          (PoseLandmarkerResult) super.processVideoData(inputPackets, timestampMs);
+      TaskResult result = super.processVideoData(inputPackets, timestampMs);
       if (result == null) {
         throw new MediaPipeException(
             MediaPipeException.StatusCode.INTERNAL.ordinal(),
@@ -682,6 +745,104 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
           packet.release();
         }
       }
+    }
+  }
+
+  /**
+   * Typed video detector with landmarks, visibility, world coordinates, and ROI telemetry only.
+   * One inference at a time per instance, on its owning inference/GL lane. Close after draining
+   * that lane. A supplied ROI always produces estimates; use resetTracking to reacquire the pose.
+   */
+  public static final class LandmarksOnly implements AutoCloseable {
+    private final PoseLandmarker delegate;
+
+    private LandmarksOnly(PoseLandmarker delegate) { this.delegate = delegate; }
+
+    public void resetTracking() { delegate.resetTracking(); }
+    @Override public void close() { delegate.close(); }
+
+    public LandmarksOnlyResult detectForVideo(MPImage image, long timestampMs) {
+      return detectForVideo(image, (NormalizedRect) null, timestampMs);
+    }
+
+    /** A null external rectangle uses normal full-frame detection/tracking. */
+    public LandmarksOnlyResult detectForVideo(
+        MPImage image, NormalizedRect externalPoseRect, long timestampMs) {
+      if (externalPoseRect != null) validateExternalPoseRect(externalPoseRect);
+      return process(image, Optional.ofNullable(externalPoseRect), Optional.empty(),
+          image.getWidth(), image.getHeight(), timestampMs);
+    }
+
+    public LandmarksOnlyResult detectForVideoWithExternalRoiCrop(
+        MPImage image, long timestampMs) {
+      return process(image, Optional.of(FULL_IMAGE_TRACKING_RECT), Optional.empty(),
+          image.getWidth(), image.getHeight(), timestampMs);
+    }
+
+    public LandmarksOnlyResult detectForVideoWithExternalRoiCrop(
+        MPImage image, NormalizedRect sourceProjectionRect,
+        int sourceImageWidth, int sourceImageHeight, long timestampMs) {
+      validateExternalPoseRect(sourceProjectionRect);
+      validateSourceImageDimensions(sourceImageWidth, sourceImageHeight);
+      return process(image, Optional.of(FULL_IMAGE_TRACKING_RECT), Optional.of(sourceProjectionRect),
+          sourceImageWidth, sourceImageHeight, timestampMs);
+    }
+
+    private LandmarksOnlyResult process(MPImage image, Optional<NormalizedRect> externalRect,
+        Optional<NormalizedRect> projectionRect, int sourceWidth, int sourceHeight,
+        long timestampMs) {
+      ImageProcessingOptions imageProcessingOptions = ImageProcessingOptions.builder().build();
+      return (LandmarksOnlyResult) delegate.processVideoData(image, imageProcessingOptions,
+          externalRect, projectionRect, sourceWidth, sourceHeight, timestampMs);
+    }
+
+    public LandmarksOnlyResult detectForVideo(TextureFrame image, long timestampMs) {
+      return detectForVideo(image, (NormalizedRect) null, timestampMs);
+    }
+
+    /** A null external rectangle uses normal full-frame detection/tracking. */
+    public LandmarksOnlyResult detectForVideo(
+        TextureFrame image, NormalizedRect externalPoseRect, long timestampMs) {
+      if (externalPoseRect != null) validateExternalPoseRect(externalPoseRect);
+      return process(image, Optional.ofNullable(externalPoseRect), Optional.empty(),
+          image.getWidth(), image.getHeight(), timestampMs);
+    }
+
+    public LandmarksOnlyResult detectForVideoWithExternalRoiCrop(
+        TextureFrame image, long timestampMs) {
+      return process(image, Optional.of(FULL_IMAGE_TRACKING_RECT), Optional.empty(),
+          image.getWidth(), image.getHeight(), timestampMs);
+    }
+
+    public LandmarksOnlyResult detectForVideoWithExternalRoiCrop(
+        TextureFrame image, NormalizedRect sourceProjectionRect,
+        int sourceImageWidth, int sourceImageHeight, long timestampMs) {
+      validateExternalPoseRect(sourceProjectionRect);
+      validateSourceImageDimensions(sourceImageWidth, sourceImageHeight);
+      return process(image, Optional.of(FULL_IMAGE_TRACKING_RECT), Optional.of(sourceProjectionRect),
+          sourceImageWidth, sourceImageHeight, timestampMs);
+    }
+
+    private LandmarksOnlyResult process(TextureFrame image, Optional<NormalizedRect> externalRect,
+        Optional<NormalizedRect> projectionRect, int sourceWidth, int sourceHeight,
+        long timestampMs) {
+      return (LandmarksOnlyResult) delegate.processVideoTextureData(image,
+          externalRect, projectionRect, sourceWidth, sourceHeight, timestampMs);
+    }
+
+    public LandmarksOnlyResult detectForVideo(MPImage image,
+        ImageProcessingOptions imageProcessingOptions, long timestampMs) {
+      return detectForVideo(image, imageProcessingOptions, null, timestampMs);
+    }
+
+    public LandmarksOnlyResult detectForVideo(MPImage image,
+        ImageProcessingOptions imageProcessingOptions, NormalizedRect externalPoseRect,
+        long timestampMs) {
+      validateImageProcessingOptions(imageProcessingOptions);
+      if (externalPoseRect != null) validateExternalPoseRect(externalPoseRect);
+      return (LandmarksOnlyResult) delegate.processVideoData(image, imageProcessingOptions,
+          Optional.ofNullable(externalPoseRect), Optional.empty(),
+          image.getWidth(), image.getHeight(), timestampMs);
     }
   }
 
@@ -867,6 +1028,10 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
     /** Converts a {@link PoseLandmarkerOptions} to a {@link CalculatorOptions} protobuf message. */
     @Override
     public CalculatorOptions convertToCalculatorOptionsProto() {
+      return convertToCalculatorOptionsProto(false);
+    }
+
+    private CalculatorOptions convertToCalculatorOptionsProto(boolean landmarksOnly) {
       PoseLandmarkerGraphOptionsProto.PoseLandmarkerGraphOptions.Builder taskOptionsBuilder =
           PoseLandmarkerGraphOptionsProto.PoseLandmarkerGraphOptions.newBuilder()
               .setBaseOptions(
@@ -887,8 +1052,10 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
       PoseLandmarksDetectorGraphOptionsProto.PoseLandmarksDetectorGraphOptions.Builder
           poseLandmarksDetectorGraphOptionsBuilder =
               PoseLandmarksDetectorGraphOptionsProto.PoseLandmarksDetectorGraphOptions.newBuilder();
-      minPosePresenceConfidence()
-          .ifPresent(poseLandmarksDetectorGraphOptionsBuilder::setMinDetectionConfidence);
+      if (!landmarksOnly) {
+        minPosePresenceConfidence()
+            .ifPresent(poseLandmarksDetectorGraphOptionsBuilder::setMinDetectionConfidence);
+      }
       minTrackingConfidence().ifPresent(taskOptionsBuilder::setMinTrackingConfidence);
 
       taskOptionsBuilder
@@ -914,7 +1081,8 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
     }
   }
 
-  private static Optional<List<MPImage>> getSegmentationMasks(List<Packet> packets) {
+  private static Optional<List<MPImage>> getSegmentationMasks(
+      List<Packet> packets, int segmentationMasksOutStreamIndex) {
     Optional<List<MPImage>> segmentedMasks = Optional.of(new ArrayList<>());
     int width =
         PacketGetter.getImageWidthFromImageList(packets.get(segmentationMasksOutStreamIndex));

@@ -39,6 +39,7 @@ limitations under the License.
 #include "mediapipe/framework/formats/image.h"
 #include "mediapipe/framework/formats/landmark.pb.h"
 #include "mediapipe/framework/formats/rect.pb.h"
+#include "mediapipe/framework/formats/tensor.h"
 #include "mediapipe/framework/subgraph.h"
 #include "mediapipe/gpu/gpu_origin.pb.h"
 #include "mediapipe/tasks/cc/common.h"
@@ -111,8 +112,8 @@ struct SinglePoseLandmarkerOutputs {
   Source<LandmarkList> world_pose_landmarks;
   Source<NormalizedLandmarkList> auxiliary_pose_landmarks;
   Source<NormalizedRect> pose_rect_next_frame;
-  Source<bool> pose_presence;
-  Source<float> pose_presence_score;
+  std::optional<Source<bool>> pose_presence;
+  std::optional<Source<float>> pose_presence_score;
   std::optional<Source<Image>> segmentation_mask;
 };
 
@@ -121,8 +122,8 @@ struct PoseLandmarkerOutputs {
   Source<std::vector<LandmarkList>> world_landmark_lists;
   Source<std::vector<NormalizedLandmarkList>> auxiliary_landmark_lists;
   Source<std::vector<NormalizedRect>> pose_rects_next_frame;
-  Source<std::vector<bool>> presences;
-  Source<std::vector<float>> presence_scores;
+  std::optional<Source<std::vector<bool>>> presences;
+  std::optional<Source<std::vector<float>>> presence_scores;
   std::optional<Source<std::vector<Image>>> segmentation_masks;
 };
 
@@ -152,7 +153,7 @@ void ConfigureSplitTensorVectorCalculator(
 
 void ConfigureTensorsToLandmarksCalculator(
     const ImageTensorSpecs& input_image_tensor_spec, bool normalize,
-    bool sigmoid_activation,
+    bool sigmoid_activation, bool landmarks_only,
     mediapipe::TensorsToLandmarksCalculatorOptions* options) {
   options->set_num_landmarks(kLandmarksNum);
   options->set_input_image_height(input_image_tensor_spec.image_height);
@@ -165,8 +166,10 @@ void ConfigureTensorsToLandmarksCalculator(
   if (sigmoid_activation) {
     options->set_visibility_activation(
         mediapipe::TensorsToLandmarksCalculatorOptions_Activation_SIGMOID);
-    options->set_presence_activation(
-        mediapipe::TensorsToLandmarksCalculatorOptions_Activation_SIGMOID);
+    if (!landmarks_only) {
+      options->set_presence_activation(
+          mediapipe::TensorsToLandmarksCalculatorOptions_Activation_SIGMOID);
+    }
   }
 }
 
@@ -206,11 +209,11 @@ void ConfigureSplitLandmarkListCalculator(
 }
 
 void ConfigureVisibilityCopyCalculator(
-    mediapipe::VisibilityCopyCalculatorOptions* options) {
+    bool landmarks_only, mediapipe::VisibilityCopyCalculatorOptions* options) {
   // Derived from
   // mediapipe/modules/pose_landmark/tensors_to_pose_landmarks_and_segmentation.pbtxt
   options->set_copy_visibility(true);
-  options->set_copy_presence(true);
+  options->set_copy_presence(!landmarks_only);
 }
 
 void ConfigureRectTransformationCalculator(
@@ -367,10 +370,11 @@ class SinglePoseLandmarksDetectorGraph : public core::ModelTaskGraph {
         graph[Output<NormalizedLandmarkList>(kAuxLandmarksTag)];
     pose_landmark_detection_outs.pose_rect_next_frame >>
         graph[Output<NormalizedRect>(kPoseRectNextFrameTag)];
-    pose_landmark_detection_outs.pose_presence >>
-        graph[Output<bool>(kPresenceTag)];
-    pose_landmark_detection_outs.pose_presence_score >>
-        graph[Output<float>(kPresenceScoreTag)];
+    if (pose_landmark_detection_outs.pose_presence) {
+      *pose_landmark_detection_outs.pose_presence >> graph[Output<bool>(kPresenceTag)];
+      *pose_landmark_detection_outs.pose_presence_score >>
+          graph[Output<float>(kPresenceScoreTag)];
+    }
     if (pose_landmark_detection_outs.segmentation_mask) {
       *pose_landmark_detection_outs.segmentation_mask >>
           graph[Output<Image>(kSegmentationMaskTag)];
@@ -378,6 +382,9 @@ class SinglePoseLandmarksDetectorGraph : public core::ModelTaskGraph {
 
     return graph.GetConfig();
   }
+
+ protected:
+  virtual bool LandmarksOnly() const { return false; }
 
  private:
   absl::StatusOr<SinglePoseLandmarkerOutputs>
@@ -389,7 +396,29 @@ class SinglePoseLandmarksDetectorGraph : public core::ModelTaskGraph {
       std::optional<Source<std::pair<int, int>>> external_source_image_size,
       std::optional<Source<bool>> use_external_source_projection, Graph& graph,
       bool output_segmentation_mask) {
-    ABSL_RETURN_IF_ERROR(SanityCheckOptions(subgraph_options));
+    if (!LandmarksOnly()) {
+      ABSL_RETURN_IF_ERROR(SanityCheckOptions(subgraph_options));
+    } else {
+      if (output_segmentation_mask) {
+        return absl::InvalidArgumentError("Landmarks-only graphs do not output masks.");
+      }
+      // Fail at construction if a legacy five-output model is accidentally supplied.
+      const auto* model = model_resources.GetTfLiteModel();
+      const auto* outputs = model->subgraphs()->Get(0)->outputs();
+      const auto* tensors = model->subgraphs()->Get(0)->tensors();
+      if (outputs->size() != 3 ||
+          tensors->Get(outputs->Get(0))->shape()->size() != 2 ||
+          tensors->Get(outputs->Get(0))->shape()->Get(0) != 1 ||
+          tensors->Get(outputs->Get(0))->shape()->Get(1) != kLandmarksNum * 4 ||
+          tensors->Get(outputs->Get(1))->shape()->size() != 4 ||
+          tensors->Get(outputs->Get(1))->shape()->Get(3) != kLandmarksNum ||
+          tensors->Get(outputs->Get(2))->shape()->size() != 2 ||
+          tensors->Get(outputs->Get(2))->shape()->Get(1) != kLandmarksNum * 3) {
+        return absl::InvalidArgumentError(
+            "Landmarks-only inference requires the pruned three-output model "
+            "with 39 x/y/z/visibility landmarks.");
+      }
+    }
 
     auto& preprocessing = graph.AddNode(
         "mediapipe.tasks.components.processors.ImagePreprocessingGraph");
@@ -405,7 +434,7 @@ class SinglePoseLandmarksDetectorGraph : public core::ModelTaskGraph {
     image_in >> preprocessing.In(kImageTag);
     pose_rect >> preprocessing.In(kNormRectTag);
     auto image_size = preprocessing[Output<std::pair<int, int>>(kImageSizeTag)];
-    auto matrix = preprocessing[Output<std::vector<float>>(kMatrixTag)];
+    // Request the affine matrix only for the legacy mask projection path.
     auto letterbox_padding = preprocessing.Out(kLetterboxPaddingTag);
 
     // The application may have already transformed a source-image ROI into
@@ -439,52 +468,56 @@ class SinglePoseLandmarksDetectorGraph : public core::ModelTaskGraph {
         model_resources, subgraph_options.base_options().acceleration(), graph);
     preprocessing.Out(kTensorsTag) >> inference.In(kTensorsTag);
 
-    // Split model output tensors to multiple streams.
     auto& split_tensors_vector = graph.AddNode("SplitTensorVectorCalculator");
-    ConfigureSplitTensorVectorCalculator(
-        &split_tensors_vector
-             .GetOptions<mediapipe::SplitVectorCalculatorOptions>());
+    auto& split_options =
+        split_tensors_vector.GetOptions<mediapipe::SplitVectorCalculatorOptions>();
+    if (LandmarksOnly()) {
+      // The pruned model computes only image landmarks, heatmap, and world landmarks.
+      for (int i = 0; i < 3; ++i) {
+        auto* range = split_options.add_ranges();
+        range->set_begin(i);
+        range->set_end(i + 1);
+      }
+    } else {
+      ConfigureSplitTensorVectorCalculator(&split_options);
+    }
     inference.Out(kTensorsTag) >> split_tensors_vector.In("");
-    auto landmark_tensors = split_tensors_vector.Out(0);
-    auto pose_flag_tensors = split_tensors_vector.Out(1);
-    auto segmentation_tensors = split_tensors_vector.Out(2);
-    auto heatmap_tensors = split_tensors_vector.Out(3);
-    auto world_landmark_tensors = split_tensors_vector.Out(4);
+    auto ensured_landmarks_tensors = split_tensors_vector.Out(0);
+    auto ensured_heatmap_tensors = split_tensors_vector.Out(LandmarksOnly() ? 1 : 3);
+    auto ensured_world_landmark_tensors = split_tensors_vector.Out(LandmarksOnly() ? 2 : 4);
+    std::optional<Source<bool>> pose_presence;
+    std::optional<Source<float>> pose_presence_score;
+    std::optional<Source<std::vector<Tensor>>> ensured_segmentation_tensors;
+    if (!LandmarksOnly()) {
+      auto& tensors_to_pose_presence = graph.AddNode("TensorsToFloatsCalculator");
+      split_tensors_vector.Out(1) >> tensors_to_pose_presence.In(kTensorsTag);
+      pose_presence_score = tensors_to_pose_presence[Output<float>(kFloatTag)];
+      auto& thresholding = graph.AddNode("ThresholdingCalculator");
+      thresholding.GetOptions<mediapipe::ThresholdingCalculatorOptions>()
+          .set_threshold(subgraph_options.min_detection_confidence());
+      *pose_presence_score >> thresholding.In(kFloatTag);
+      pose_presence = thresholding[Output<bool>(kFlagTag)];
 
-    // Converts the pose-flag tensor into a float that represents the confidence
-    // score of pose presence.
-    auto& tensors_to_pose_presence = graph.AddNode("TensorsToFloatsCalculator");
-    pose_flag_tensors >> tensors_to_pose_presence.In(kTensorsTag);
-    auto pose_presence_score =
-        tensors_to_pose_presence[Output<float>(kFloatTag)];
-
-    // Applies a threshold to the confidence score to determine whether a
-    // pose is present.
-    auto& pose_presence_thresholding = graph.AddNode("ThresholdingCalculator");
-    pose_presence_thresholding
-        .GetOptions<mediapipe::ThresholdingCalculatorOptions>()
-        .set_threshold(subgraph_options.min_detection_confidence());
-    pose_presence_score >> pose_presence_thresholding.In(kFloatTag);
-    auto pose_presence = pose_presence_thresholding[Output<bool>(kFlagTag)];
-
-    // GateCalculator for tensors.
-    auto& tensors_gate = graph.AddNode("GateCalculator");
-    landmark_tensors >> tensors_gate.In("")[0];
-    segmentation_tensors >> tensors_gate.In("")[1];
-    heatmap_tensors >> tensors_gate.In("")[2];
-    world_landmark_tensors >> tensors_gate.In("")[3];
-    pose_presence >> tensors_gate.In("ALLOW");
-    auto ensured_landmarks_tensors = tensors_gate.Out(0);
-    auto ensured_segmentation_tensors = tensors_gate.Out(1);
-    auto ensured_heatmap_tensors = tensors_gate.Out(2);
-    auto ensured_world_landmark_tensors = tensors_gate.Out(3);
+      auto& gate = graph.AddNode("GateCalculator");
+      ensured_landmarks_tensors >> gate.In("")[0];
+      ensured_heatmap_tensors >> gate.In("")[1];
+      ensured_world_landmark_tensors >> gate.In("")[2];
+      *pose_presence >> gate.In("ALLOW");
+      ensured_landmarks_tensors = gate.Out(0);
+      ensured_heatmap_tensors = gate.Out(1);
+      ensured_world_landmark_tensors = gate.Out(2);
+      if (output_segmentation_mask) {
+        split_tensors_vector.Out(2) >> gate.In("")[3];
+        ensured_segmentation_tensors = gate.Out(3).Cast<std::vector<Tensor>>();
+      }
+    }
 
     // Decodes the landmark tensors into a list of landmarks, where the landmark
     // coordinates are normalized by the size of the input image to the model.
     auto& tensors_to_landmarks = graph.AddNode("TensorsToLandmarksCalculator");
     ConfigureTensorsToLandmarksCalculator(
         image_tensor_specs, /* normalize = */ false,
-        /*sigmoid_activation= */ true,
+        /*sigmoid_activation= */ true, LandmarksOnly(),
         &tensors_to_landmarks
              .GetOptions<mediapipe::TensorsToLandmarksCalculatorOptions>());
     ensured_landmarks_tensors >> tensors_to_landmarks.In(kTensorsTag);
@@ -498,6 +531,10 @@ class SinglePoseLandmarksDetectorGraph : public core::ModelTaskGraph {
     ConfigureRefineLandmarksFromHeatmapCalculator(
         &refine_landmarks_from_heatmap.GetOptions<
             mediapipe::RefineLandmarksFromHeatmapCalculatorOptions>());
+    if (LandmarksOnly()) {
+      refine_landmarks_from_heatmap.GetOptions<
+          mediapipe::RefineLandmarksFromHeatmapCalculatorOptions>().set_refine_presence(false);
+    }
     ensured_heatmap_tensors >> refine_landmarks_from_heatmap.In(kTensorsTag);
     raw_landmarks >> refine_landmarks_from_heatmap.In(kNormLandmarksTag);
     auto landmarks_from_heatmap =
@@ -522,7 +559,7 @@ class SinglePoseLandmarksDetectorGraph : public core::ModelTaskGraph {
         graph.AddNode("TensorsToLandmarksCalculator");
     ConfigureTensorsToLandmarksCalculator(
         image_tensor_specs, /* normalize = */ false,
-        /* sigmoid_activation= */ false,
+        /* sigmoid_activation= */ false, LandmarksOnly(),
         &tensors_to_world_landmarks
              .GetOptions<mediapipe::TensorsToLandmarksCalculatorOptions>());
     ensured_world_landmark_tensors >>
@@ -542,7 +579,7 @@ class SinglePoseLandmarksDetectorGraph : public core::ModelTaskGraph {
     // landmarks.
     auto& visibility_copy = graph.AddNode("VisibilityCopyCalculator");
     ConfigureVisibilityCopyCalculator(
-        &visibility_copy
+        LandmarksOnly(), &visibility_copy
              .GetOptions<mediapipe::VisibilityCopyCalculatorOptions>());
     split_landmarks >> visibility_copy.In(kLandmarksToTag);
     landmarks >> visibility_copy.In(kNormLandmarksFromTag);
@@ -606,13 +643,13 @@ class SinglePoseLandmarksDetectorGraph : public core::ModelTaskGraph {
       ConfigureTensorsToSegmentationCalculator(
           &tensors_to_segmentation.GetOptions<
               mediapipe::TensorsToSegmentationCalculatorOptions>());
-      ensured_segmentation_tensors >> tensors_to_segmentation.In(kTensorsTag);
+      *ensured_segmentation_tensors >> tensors_to_segmentation.In(kTensorsTag);
       auto raw_segmentation_mask =
           tensors_to_segmentation[Output<Image>(kMaskTag)];
 
       // Calculates the inverse transformation matrix.
       auto& inverse_matrix = graph.AddNode("InverseMatrixCalculator");
-      matrix >> inverse_matrix.In(kMatrixTag);
+      preprocessing.Out(kMatrixTag) >> inverse_matrix.In(kMatrixTag);
       auto inverted_matrix = inverse_matrix.Out(kMatrixTag);
 
       // Projects the segmentation mask from the letterboxed ROI back to the
@@ -663,6 +700,13 @@ class SinglePoseLandmarksDetectorGraph : public core::ModelTaskGraph {
     }};
   }
 };
+
+class SinglePoseLandmarksOnlyDetectorGraph : public SinglePoseLandmarksDetectorGraph {
+ protected:
+  bool LandmarksOnly() const override { return true; }
+};
+REGISTER_MEDIAPIPE_GRAPH(
+    ::mediapipe::tasks::vision::pose_landmarker::SinglePoseLandmarksOnlyDetectorGraph);
 
 // clang-format off
 REGISTER_MEDIAPIPE_GRAPH(
@@ -783,10 +827,12 @@ class MultiplePoseLandmarksDetectorGraph : public core::ModelTaskGraph {
         graph[Output<std::vector<NormalizedLandmarkList>>(kAuxLandmarksTag)];
     pose_landmark_detection_outputs.pose_rects_next_frame >>
         graph[Output<std::vector<NormalizedRect>>(kPoseRectsNextFrameTag)];
-    pose_landmark_detection_outputs.presences >>
-        graph[Output<std::vector<bool>>(kPresenceTag)];
-    pose_landmark_detection_outputs.presence_scores >>
-        graph[Output<std::vector<float>>(kPresenceScoreTag)];
+    if (pose_landmark_detection_outputs.presences) {
+      *pose_landmark_detection_outputs.presences >>
+          graph[Output<std::vector<bool>>(kPresenceTag)];
+      *pose_landmark_detection_outputs.presence_scores >>
+          graph[Output<std::vector<float>>(kPresenceScoreTag)];
+    }
     if (pose_landmark_detection_outputs.segmentation_masks) {
       *pose_landmark_detection_outputs.segmentation_masks >>
           graph[Output<std::vector<Image>>(kSegmentationMaskTag)];
@@ -794,6 +840,9 @@ class MultiplePoseLandmarksDetectorGraph : public core::ModelTaskGraph {
 
     return graph.GetConfig();
   }
+
+ protected:
+  virtual bool LandmarksOnly() const { return false; }
 
  private:
   absl::StatusOr<PoseLandmarkerOutputs> BuildPoseLandmarksDetectorGraph(
@@ -845,8 +894,9 @@ class MultiplePoseLandmarksDetectorGraph : public core::ModelTaskGraph {
     }
 
     auto& pose_landmark_subgraph = graph.AddNode(
-        "mediapipe.tasks.vision.pose_landmarker."
-        "SinglePoseLandmarksDetectorGraph");
+        LandmarksOnly()
+            ? "mediapipe.tasks.vision.pose_landmarker.SinglePoseLandmarksOnlyDetectorGraph"
+            : "mediapipe.tasks.vision.pose_landmarker.SinglePoseLandmarksDetectorGraph");
     pose_landmark_subgraph.GetOptions<PoseLandmarksDetectorGraphOptions>() =
         subgraph_options;
     image >> pose_landmark_subgraph.In(kImageTag);
@@ -865,8 +915,6 @@ class MultiplePoseLandmarksDetectorGraph : public core::ModelTaskGraph {
     auto auxiliary_landmarks = pose_landmark_subgraph.Out(kAuxLandmarksTag);
     auto pose_rect_next_frame =
         pose_landmark_subgraph.Out(kPoseRectNextFrameTag);
-    auto presence = pose_landmark_subgraph.Out(kPresenceTag);
-    auto presence_score = pose_landmark_subgraph.Out(kPresenceScoreTag);
 
     auto& end_loop_landmarks =
         graph.AddNode("EndLoopNormalizedLandmarkListVectorCalculator");
@@ -899,16 +947,19 @@ class MultiplePoseLandmarksDetectorGraph : public core::ModelTaskGraph {
         end_loop_rects_next_frame[Output<std::vector<NormalizedRect>>(
             kIterableTag)];
 
-    auto& end_loop_presence = graph.AddNode("EndLoopBooleanCalculator");
-    batch_end >> end_loop_presence.In(kBatchEndTag);
-    presence >> end_loop_presence.In(kItemTag);
-    auto presences = end_loop_presence[Output<std::vector<bool>>(kIterableTag)];
+    std::optional<Source<std::vector<bool>>> presences;
+    std::optional<Source<std::vector<float>>> presence_scores;
+    if (!LandmarksOnly()) {
+      auto& end_loop_presence = graph.AddNode("EndLoopBooleanCalculator");
+      batch_end >> end_loop_presence.In(kBatchEndTag);
+      pose_landmark_subgraph.Out(kPresenceTag) >> end_loop_presence.In(kItemTag);
+      presences = end_loop_presence[Output<std::vector<bool>>(kIterableTag)];
 
-    auto& end_loop_presence_score = graph.AddNode("EndLoopFloatCalculator");
-    batch_end >> end_loop_presence_score.In(kBatchEndTag);
-    presence_score >> end_loop_presence_score.In(kItemTag);
-    auto presence_scores =
-        end_loop_presence_score[Output<std::vector<float>>(kIterableTag)];
+      auto& end_loop_presence_score = graph.AddNode("EndLoopFloatCalculator");
+      batch_end >> end_loop_presence_score.In(kBatchEndTag);
+      pose_landmark_subgraph.Out(kPresenceScoreTag) >> end_loop_presence_score.In(kItemTag);
+      presence_scores = end_loop_presence_score[Output<std::vector<float>>(kIterableTag)];
+    }
 
     std::optional<Stream<std::vector<Image>>> segmentation_masks_vector;
     if (output_segmentation_masks) {
@@ -995,6 +1046,13 @@ class MultiplePoseLandmarksDetectorGraph : public core::ModelTaskGraph {
     }};
   }
 };
+
+class MultiplePoseLandmarksOnlyDetectorGraph : public MultiplePoseLandmarksDetectorGraph {
+ protected:
+  bool LandmarksOnly() const override { return true; }
+};
+REGISTER_MEDIAPIPE_GRAPH(
+    ::mediapipe::tasks::vision::pose_landmarker::MultiplePoseLandmarksOnlyDetectorGraph);
 
 // clang-format off
 REGISTER_MEDIAPIPE_GRAPH(

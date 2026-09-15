@@ -98,6 +98,7 @@ cc_library(
         "//mediapipe/framework/formats:image",
         "//mediapipe/framework/formats:landmark_cc_proto",
         "//mediapipe/framework/formats:rect_cc_proto",
+        "//mediapipe/framework/formats:tensor",
         "//mediapipe/gpu:gpu_origin_cc_proto",
         "//mediapipe/tasks/cc:common",
         "//mediapipe/tasks/cc/components/processors:image_preprocessing_graph",

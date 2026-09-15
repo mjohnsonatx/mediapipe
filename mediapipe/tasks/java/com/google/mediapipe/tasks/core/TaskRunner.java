@@ -118,26 +118,56 @@ public class TaskRunner implements AutoCloseable {
             context, taskInfo.taskName(), taskInfo.taskRunningModeName());
     AndroidAssetUtil.initializeNativeAssetManager(context);
     Graph mediapipeGraph = new Graph();
-    if (parentGlContext != 0L) {
-      mediapipeGraph.setParentGlContext(parentGlContext);
+    ModelResourcesCache graphModelResourcesCache = null;
+    boolean started = false;
+    try {
+      if (parentGlContext != 0L) {
+        mediapipeGraph.setParentGlContext(parentGlContext);
+      }
+      mediapipeGraph.loadBinaryGraph(taskInfo.generateGraphConfig());
+      if (extraSidePackets != null && !extraSidePackets.isEmpty()) {
+        mediapipeGraph.setInputSidePackets(extraSidePackets);
+      }
+      graphModelResourcesCache = new ModelResourcesCache();
+      mediapipeGraph.setServiceObject(new ModelResourcesCacheService(), graphModelResourcesCache);
+      mediapipeGraph.addMultiStreamCallback(
+          taskInfo.outputStreamNames(),
+          packets -> {
+            outputHandler.run(packets);
+            statsLogger.recordInvocationEnd(packets.get(0).getTimestamp());
+          },
+          /* observeTimestampBounds= */ outputHandler.handleTimestampBoundChanges());
+      mediapipeGraph.startRunningGraph();
+      started = true;
+      // Waits until all calculators are opened and the graph is fully started.
+      mediapipeGraph.waitUntilGraphIdle();
+      return new TaskRunner(mediapipeGraph, graphModelResourcesCache, outputHandler, statsLogger);
+    } catch (RuntimeException creationFailure) {
+      // Construction may fail before a TaskRunner exists for the caller to close. Cancel an
+      // opened graph before freeing its model service, and preserve the original failure for
+      // the application's delegate retry/CPU fallback and error reporting.
+      if (started) {
+        try {
+          mediapipeGraph.cancelGraph();
+          mediapipeGraph.waitUntilGraphDone();
+        } catch (RuntimeException cleanupFailure) {
+          creationFailure.addSuppressed(cleanupFailure);
+        }
+      }
+      try {
+        mediapipeGraph.tearDown();
+      } catch (RuntimeException cleanupFailure) {
+        creationFailure.addSuppressed(cleanupFailure);
+      }
+      if (graphModelResourcesCache != null) {
+        try {
+          graphModelResourcesCache.release();
+        } catch (RuntimeException cleanupFailure) {
+          creationFailure.addSuppressed(cleanupFailure);
+        }
+      }
+      throw creationFailure;
     }
-    mediapipeGraph.loadBinaryGraph(taskInfo.generateGraphConfig());
-    if (extraSidePackets != null && !extraSidePackets.isEmpty()) {
-      mediapipeGraph.setInputSidePackets(extraSidePackets);
-    }
-    ModelResourcesCache graphModelResourcesCache = new ModelResourcesCache();
-    mediapipeGraph.setServiceObject(new ModelResourcesCacheService(), graphModelResourcesCache);
-    mediapipeGraph.addMultiStreamCallback(
-        taskInfo.outputStreamNames(),
-        packets -> {
-          outputHandler.run(packets);
-          statsLogger.recordInvocationEnd(packets.get(0).getTimestamp());
-        },
-        /* observeTimestampBounds= */ outputHandler.handleTimestampBoundChanges());
-    mediapipeGraph.startRunningGraph();
-    // Waits until all calculators are opened and the graph is fully started.
-    mediapipeGraph.waitUntilGraphIdle();
-    return new TaskRunner(mediapipeGraph, graphModelResourcesCache, outputHandler, statsLogger);
   }
 
   /**

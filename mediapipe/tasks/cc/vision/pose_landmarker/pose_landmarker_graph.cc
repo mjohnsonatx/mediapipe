@@ -263,6 +263,9 @@ class PoseLandmarkerGraph : public core::ModelTaskGraph {
     Graph graph;
     bool output_segmentation_masks =
         HasOutput(sc->OriginalNode(), kSegmentationMaskTag);
+    if (LandmarksOnly() && output_segmentation_masks) {
+      return absl::InvalidArgumentError("Landmarks-only graphs do not output masks.");
+    }
     if (sc->Options<PoseLandmarkerGraphOptions>()
             .base_options()
             .has_model_asset()) {
@@ -356,6 +359,9 @@ class PoseLandmarkerGraph : public core::ModelTaskGraph {
     return config;
   }
 
+ protected:
+  virtual bool LandmarksOnly() const { return false; }
+
  private:
   // Adds a mediapipe pose landmarker graph into the provided builder::Graph
   // instance.
@@ -390,8 +396,9 @@ class PoseLandmarkerGraph : public core::ModelTaskGraph {
     auto clipped_pose_rects = clip_pose_rects.Out("");
 
     auto& pose_landmarks_detector_graph = graph.AddNode(
-        "mediapipe.tasks.vision.pose_landmarker."
-        "MultiplePoseLandmarksDetectorGraph");
+        LandmarksOnly()
+            ? "mediapipe.tasks.vision.pose_landmarker.MultiplePoseLandmarksOnlyDetectorGraph"
+            : "mediapipe.tasks.vision.pose_landmarker.MultiplePoseLandmarksDetectorGraph");
     auto& pose_landmarks_detector_graph_options =
         pose_landmarks_detector_graph
             .GetOptions<PoseLandmarksDetectorGraphOptions>();
@@ -537,6 +544,15 @@ class PoseLandmarkerGraph : public core::ModelTaskGraph {
     }};
   }
 };
+
+// Shares ROI selection, projection, smoothing, and reset semantics with the legacy graph.
+// Requires a three-output model with four values (x/y/z/visibility) per image landmark.
+class PoseLandmarkerLandmarksOnlyGraph : public PoseLandmarkerGraph {
+ protected:
+  bool LandmarksOnly() const override { return true; }
+};
+REGISTER_MEDIAPIPE_GRAPH(
+    ::mediapipe::tasks::vision::pose_landmarker::PoseLandmarkerLandmarksOnlyGraph);
 
 REGISTER_MEDIAPIPE_GRAPH(
     ::mediapipe::tasks::vision::pose_landmarker::PoseLandmarkerGraph);
