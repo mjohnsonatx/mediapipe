@@ -121,7 +121,8 @@ struct PoseLandmarkerGraphTestParams {
 
 // Helper function to create a PoseLandmarkerGraph TaskRunner.
 absl::StatusOr<std::unique_ptr<TaskRunner>> CreatePoseLandmarkerGraphTaskRunner(
-    absl::string_view model_name, bool enable_external_pose_rect = false) {
+    absl::string_view model_name, bool enable_external_pose_rect = false,
+    std::optional<bool> smooth_landmarks = std::nullopt) {
   Graph graph;
 
   auto& pose_landmarker = graph.AddNode(
@@ -133,6 +134,10 @@ absl::StatusOr<std::unique_ptr<TaskRunner>> CreatePoseLandmarkerGraphTaskRunner(
       JoinPath("./", kTestDataDirectory, model_name));
   options->mutable_pose_detector_graph_options()->set_num_poses(1);
   options->mutable_base_options()->set_use_stream_mode(true);
+  if (smooth_landmarks.has_value()) {
+    options->mutable_pose_landmarks_detector_graph_options()->set_smooth_landmarks(
+        *smooth_landmarks);
+  }
 
   graph[Input<Image>(kImageTag)].SetName(kImageName) >>
       pose_landmarker.In(kImageTag);
@@ -264,6 +269,36 @@ TEST_P(PoseLandmarkerGraphTest, Succeeds) {
   MP_ASSERT_OK_AND_ASSIGN(auto output_path,
                           SavePngTestOutput(segmentation_mask_image_frame,
                                             "segmentation_mask_output"));
+}
+
+TEST(PoseLandmarkerGraphSmoothingTest, ExplicitFalseDisablesAllTemporalFilters) {
+  for (const auto smooth_landmarks :
+       {std::optional<bool>(), std::optional<bool>(true),
+        std::optional<bool>(false)}) {
+    MP_ASSERT_OK_AND_ASSIGN(
+        auto task_runner,
+        CreatePoseLandmarkerGraphTaskRunner(kPoseLandmarkerModelBundleName,
+                                            /*enable_external_pose_rect=*/false,
+                                            smooth_landmarks));
+    int landmark_filters = 0;
+    int visibility_filters = 0;
+    for (const auto& node : task_runner->GetGraphConfig().node()) {
+      if (node.calculator() == "LandmarksSmoothingCalculator") {
+        ++landmark_filters;
+      }
+      if (node.calculator() == "VisibilitySmoothingCalculator") {
+        ++visibility_filters;
+      }
+    }
+    if (smooth_landmarks.value_or(true)) {
+      EXPECT_GT(landmark_filters, 0);
+      EXPECT_GT(visibility_filters, 0);
+    } else {
+      EXPECT_EQ(landmark_filters, 0);
+      EXPECT_EQ(visibility_filters, 0);
+    }
+    MP_ASSERT_OK(task_runner->Close());
+  }
 }
 
 TEST(PoseLandmarkerGraphExternalRectTest,

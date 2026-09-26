@@ -163,3 +163,42 @@ this if the app seeds with the previous frame's time.
   spike; after it, it should look like any other frame.
 - Also compare lane-alternation jitter with adaptive detection off and round robin on. Option A
   should reduce it as well.
+
+## Implementation record (2026-09-26)
+
+Option A is implemented on `FORM-FOCUS-MASTER`, based on
+`c01cbd7a2b960661cb9663e4c1a0650bb305537c`. The Java option remains absent by default;
+an explicit `setSmoothLandmarks(false)` now reaches the native graph without being overwritten
+by VIDEO-mode defaults. The multi-pose smoothing guard is retained.
+
+The consumer change is in `/home/michaeljohnson/StudioProjects/PoseDetectionApp` on
+`HDR-CONVERSTIONS-ONLY`. Its shared options cache disables graph smoothing for every model
+family and delegate, including CPU fallback and temporary families. The delegate benchmark
+uses the same setting. Preprocessing shares that detector pool, so newly inferred preprocessing
+data also inherits the option; existing saved data is unchanged. App EMA/EKF values, family
+debounce, ROI tracking/reset, and projection dimensions were preserved for owner tuning.
+
+The app's `infra/tools/mediapipe/build_external_roi_aar.sh` rebuilt the native library and both
+AARs using Bazel 7.7.0, NDK 28.2.13676358, JBR 25.0.3, Python 3.12, ARM64, and `opt` with
+stripping. Shared-GL exports and external OpenCV linkage passed the script's packaging gates.
+The coordinated development revision is `formfocus-mediapipe-0.10.29-r8`:
+
+- Vision AAR SHA-256: `ccbeb67f2450393a4e12ffb26a192bacd6aa39c3dda649bbde29fccc6825e582`.
+- ARM64 JNI SHA-256: `0654ce9ed4c35a4cf9a3c107168974ad9ad3e4ce36d2b90b3cde26f4b643978c`.
+- Core AAR SHA-256: `794ff7cd448933bb6753be1f51feed520391adf9e57541fd08d8c0c65effc859`
+  (byte-identical to r7).
+- App manifest SHA-256: `e3a1f70048f7e7c757bb1812626ac31253d6f5a5f2d86f018a80962ca829b017`.
+
+The manifest pins the actual fork branch/base and changed source/test/build files. The app's
+artifact inventory and modification notice match the new payload. Production approval remains
+on r7 pending owner testing and review.
+
+Consumer verification passed offline with `:app:verifyCustomMediaPipeArtifacts` and
+`:app:compileDevDebugKotlin`. The packaged AAR's Java builder also exposes the new setter.
+
+Regression cases were added to `PoseLandmarkerTest`, `MediaPipePoseDetectorAdapterTest`, and
+the newly exposed `//mediapipe/tasks/cc/vision/pose_landmarker:pose_landmarker_graph_test`
+target (`--test_filter=PoseLandmarkerGraphSmoothingTest.*`). The native case checks that explicit
+false removes both landmark and visibility smoothing nodes, while default/true retain them.
+Test suites and device profiling were not run, as requested. The remaining owner work is
+30/60 FPS playback validation and any EMA/EKF retuning those results justify.

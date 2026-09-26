@@ -798,6 +798,15 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
       /** Sets the minimum confidence score for the pose tracking to be considered successful. */
       public abstract Builder setMinTrackingConfidence(Float value);
 
+      /**
+       * Overrides temporal smoothing of pose landmarks and visibility. When unset, smoothing
+       * defaults to enabled for a single pose in VIDEO and LIVE_STREAM modes and disabled in
+       * IMAGE mode. Smoothing is only supported for a single pose.
+       *
+       * <p>Set to false when the caller owns temporal filtering across landmarker instances.
+       */
+      public abstract Builder setSmoothLandmarks(Boolean value);
+
       public abstract Builder setOutputSegmentationMasks(boolean value);
 
       /**
@@ -848,6 +857,8 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
 
     abstract Optional<Float> minTrackingConfidence();
 
+    abstract Optional<Boolean> smoothLandmarks();
+
     abstract boolean outputSegmentationMasks();
 
     abstract Optional<ResultListener<PoseLandmarkerResult, MPImage>> resultListener();
@@ -889,6 +900,7 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
               PoseLandmarksDetectorGraphOptionsProto.PoseLandmarksDetectorGraphOptions.newBuilder();
       minPosePresenceConfidence()
           .ifPresent(poseLandmarksDetectorGraphOptionsBuilder::setMinDetectionConfidence);
+      smoothLandmarks().ifPresent(poseLandmarksDetectorGraphOptionsBuilder::setSmoothLandmarks);
       minTrackingConfidence().ifPresent(taskOptionsBuilder::setMinTrackingConfidence);
 
       taskOptionsBuilder

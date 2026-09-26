@@ -35,6 +35,7 @@ import com.google.mediapipe.tasks.core.BaseOptions;
 import com.google.mediapipe.tasks.vision.core.ImageProcessingOptions;
 import com.google.mediapipe.tasks.vision.core.RunningMode;
 import com.google.mediapipe.tasks.vision.poselandmarker.PoseLandmarker.PoseLandmarkerOptions;
+import com.google.mediapipe.tasks.vision.poselandmarker.proto.PoseLandmarkerGraphOptionsProto;
 import java.io.InputStream;
 import java.util.Arrays;
 import java.util.List;
@@ -61,6 +62,49 @@ public class PoseLandmarkerTest {
 
   @RunWith(AndroidJUnit4.class)
   public static final class General extends PoseLandmarkerTest {
+
+    @Test
+    public void options_smoothingRemainsUnsetByDefault() {
+      PoseLandmarkerOptions options =
+          PoseLandmarkerOptions.builder()
+              .setBaseOptions(
+                  BaseOptions.builder().setModelAssetPath(POSE_LANDMARKER_BUNDLE_ASSET_FILE).build())
+              .setRunningMode(RunningMode.VIDEO)
+              .build();
+      assertThat(options.smoothLandmarks().isPresent()).isFalse();
+      assertThat(
+              options.convertToCalculatorOptionsProto()
+                  .getExtension(PoseLandmarkerGraphOptionsProto.PoseLandmarkerGraphOptions.ext)
+                  .getPoseLandmarksDetectorGraphOptions()
+                  .hasSmoothLandmarks())
+          .isFalse();
+    }
+
+    @Test
+    public void options_serializesExplicitSmoothingOverride() {
+      for (boolean smoothLandmarks : new boolean[] {false, true}) {
+        PoseLandmarkerOptions options =
+            PoseLandmarkerOptions.builder()
+                .setBaseOptions(
+                    BaseOptions.builder().setModelAssetPath(POSE_LANDMARKER_BUNDLE_ASSET_FILE).build())
+                .setRunningMode(RunningMode.VIDEO)
+                .setSmoothLandmarks(smoothLandmarks)
+                .build();
+        assertThat(options.smoothLandmarks()).isEqualTo(Optional.of(smoothLandmarks));
+        assertThat(
+                options.convertToCalculatorOptionsProto()
+                    .getExtension(PoseLandmarkerGraphOptionsProto.PoseLandmarkerGraphOptions.ext)
+                    .getPoseLandmarksDetectorGraphOptions()
+                    .hasSmoothLandmarks())
+            .isTrue();
+        assertThat(
+                options.convertToCalculatorOptionsProto()
+                    .getExtension(PoseLandmarkerGraphOptionsProto.PoseLandmarkerGraphOptions.ext)
+                    .getPoseLandmarksDetectorGraphOptions()
+                    .getSmoothLandmarks())
+            .isEqualTo(smoothLandmarks);
+      }
+    }
 
     @Test
     public void detect_successWithValidModels() throws Exception {

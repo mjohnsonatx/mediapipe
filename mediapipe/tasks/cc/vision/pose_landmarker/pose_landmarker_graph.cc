@@ -402,8 +402,12 @@ class PoseLandmarkerGraph : public core::ModelTaskGraph {
     // Apply smoothing filter only on the single pose landmarks, because
     // landmarks smoothing calculator doesn't support multiple landmarks yet.
     if (pose_detector_options.num_poses() == 1) {
-      pose_landmarks_detector_graph_options.set_smooth_landmarks(
-          tasks_options.base_options().use_stream_mode());
+      // Preserve an explicit override for clients that share temporal filtering
+      // across multiple landmarker instances. Otherwise retain the mode default.
+      if (!pose_landmarks_detector_graph_options.has_smooth_landmarks()) {
+        pose_landmarks_detector_graph_options.set_smooth_landmarks(
+            tasks_options.base_options().use_stream_mode());
+      }
     } else if (pose_detector_options.num_poses() > 1 &&
                pose_landmarks_detector_graph_options.smooth_landmarks()) {
       return absl::InvalidArgumentError(
