@@ -18,6 +18,7 @@
 
 // Defines MEDIAPIPE_TENSOR_USE_AHWB
 #include "mediapipe/framework/port.h"
+#include "mediapipe/framework/tensor_buffer_pool.h"
 #include "mediapipe/gpu/multi_pool.h"
 
 #ifdef MEDIAPIPE_TENSOR_USE_AHWB
@@ -53,7 +54,6 @@ namespace mediapipe {
 //       Tensor tensor(Tensor::ElementType::kFloat32,
 //                     Tensor::Shape{kTensorSize}, &memory_manager_);
 
-#ifdef MEDIAPIPE_TENSOR_USE_AHWB
 class MemoryManager {
  public:
   // If prefer_ahwb is true, Tensors written on CPU and read as OpenGL buffers
@@ -63,32 +63,33 @@ class MemoryManager {
   // to avoid unnecessary AHWB allocations.
   explicit MemoryManager(MultiPoolOptions options = kDefaultMultiPoolOptions,
                          bool prefer_ahwb = false) {
+#ifdef MEDIAPIPE_TENSOR_USE_AHWB
     hardware_buffer_pool_ =
-        std::make_shared<HardwareBufferPool>(std::move(options));
+        std::make_shared<HardwareBufferPool>(options);
+#endif
+    tensor_buffer_pool_ = std::make_shared<TensorBufferPool>(options);
     prefer_ahwb_ = prefer_ahwb;
   }
 
+#ifdef MEDIAPIPE_TENSOR_USE_AHWB
   std::shared_ptr<HardwareBufferPool> GetAndroidHardwareBufferPool() const {
     return hardware_buffer_pool_;
+  }
+#endif
+
+  std::shared_ptr<TensorBufferPool> GetTensorBufferPool() const {
+    return tensor_buffer_pool_;
   }
 
   bool PreferAhwb() const { return prefer_ahwb_; }
 
  private:
+#ifdef MEDIAPIPE_TENSOR_USE_AHWB
   std::shared_ptr<HardwareBufferPool> hardware_buffer_pool_;
+#endif
+  std::shared_ptr<TensorBufferPool> tensor_buffer_pool_;
   bool prefer_ahwb_ = false;
 };
-#else
-
-// Dummy MemoryManager class for platforms that don't use AHWB.
-class MemoryManager {
- public:
-  explicit MemoryManager(MultiPoolOptions options = kDefaultMultiPoolOptions,
-                         bool prefer_ahwb = false) {}
-  bool PreferAhwb() const { return false; }
-};
-
-#endif  // MEDIAPIPE_TENSOR_USE_AHWB
 
 }  //  namespace mediapipe
 

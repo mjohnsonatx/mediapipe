@@ -93,6 +93,8 @@ cc_library(
         "//mediapipe/framework:calculator_profile_cc_proto",
         "//mediapipe/framework:camera_intrinsics",
         "//mediapipe/framework:graph_service",
+        "//mediapipe/framework:memory_manager",
+        "//mediapipe/framework:memory_manager_service",
         "//mediapipe/framework:packet",
         "//mediapipe/framework/formats:image",
         "//mediapipe/framework/formats:image_format_cc_proto",

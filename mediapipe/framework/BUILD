@@ -1943,11 +1943,20 @@ cc_test(
 
 cc_library(
     name = "memory_manager",
-    hdrs = ["memory_manager.h"],
+    srcs = ["tensor_buffer_pool.cc"],
+    hdrs = [
+        "memory_manager.h",
+        "tensor_buffer_pool.h",
+    ],
     visibility = ["//visibility:public"],
     deps = [
         ":port",
+        "//mediapipe/gpu:gl_base",
+        "//mediapipe/gpu:gl_context",
         "//mediapipe/gpu:multi_pool",
+        "@com_google_absl//absl/container:inlined_vector",
+        "@com_google_absl//absl/log:absl_check",
+        "@com_google_absl//absl/synchronization",
     ] + select({
         "//mediapipe:android": [
             "//mediapipe/framework/formats:hardware_buffer_pool",
@@ -1963,6 +1972,18 @@ cc_library(
     deps = [
         ":graph_service",
         ":memory_manager",
+    ],
+)
+
+cc_test(
+    name = "tensor_buffer_pool_test",
+    srcs = ["tensor_buffer_pool_test.cc"],
+    deps = [
+        ":memory_manager",
+        "//mediapipe/framework/port:gtest_main",
+        "//mediapipe/gpu:gl_base",
+        "//mediapipe/gpu:gl_context",
+        "//mediapipe/gpu:multi_pool",
     ],
 )
 

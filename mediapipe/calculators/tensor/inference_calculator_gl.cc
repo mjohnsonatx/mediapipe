@@ -31,6 +31,8 @@
 #include "mediapipe/framework/api2/packet.h"
 #include "mediapipe/framework/calculator_framework.h"
 #include "mediapipe/framework/formats/tensor.h"
+#include "mediapipe/framework/memory_manager.h"
+#include "mediapipe/framework/memory_manager_service.h"
 #include "mediapipe/framework/mediapipe_profiling.h"
 #include "mediapipe/framework/port/ret_check.h"
 #include "mediapipe/framework/port/status_macros.h"
@@ -116,6 +118,7 @@ class InferenceCalculatorGlImpl
 
     size_t output_size_ = 0;
     InputOutputTensorNames input_output_tensor_names_;
+    MemoryManager* memory_manager_ = nullptr;
   };
 
   absl::StatusOr<std::vector<Tensor>> Process(
@@ -140,6 +143,9 @@ InferenceCalculatorGlImpl::GpuInferenceRunner::~GpuInferenceRunner() {
 absl::Status InferenceCalculatorGlImpl::GpuInferenceRunner::Init(
     CalculatorContext* cc, std::shared_ptr<GlContext> gl_context) {
   init_gl_context_ = gl_context;
+  if (cc->Service(kMemoryManagerService).IsAvailable()) {
+    memory_manager_ = &cc->Service(kMemoryManagerService).GetObject();
+  }
   ABSL_RETURN_IF_ERROR(LoadModel(cc));
   const auto& options = cc->Options<mediapipe::InferenceCalculatorOptions>();
   mediapipe::InferenceCalculatorOptions::Delegate delegate_options =
@@ -281,7 +287,7 @@ absl::Status InferenceCalculatorGlImpl::GpuInferenceRunner::Process(
     const auto& out_buffer = gpu_buffers_out_[i];
     glBindBuffer(GL_COPY_READ_BUFFER, out_buffer.name());
     output_tensors.emplace_back(Tensor::ElementType::kFloat32,
-                                out_buffer.shape());
+                                out_buffer.shape(), memory_manager_);
     auto write_view = output_tensors.back().GetOpenGlBufferWriteView();
     glBindBuffer(GL_COPY_WRITE_BUFFER, write_view.name());
     glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, 0, 0,
@@ -304,6 +310,7 @@ absl::Status InferenceCalculatorGlImpl::UpdateContract(CalculatorContract* cc) {
       << "Either model as side packet or model path in options is required.";
 
   WarnFeedbackTensorsUnsupported(cc);
+  cc->UseService(kMemoryManagerService).Optional();
   return mediapipe::GlCalculatorHelper::UpdateContract(cc);
 }
 

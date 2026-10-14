@@ -33,6 +33,8 @@
 #include "absl/synchronization/mutex.h"
 #include "mediapipe/framework/calculator_framework.h"
 #include "mediapipe/framework/graph_service.h"
+#include "mediapipe/framework/memory_manager.h"
+#include "mediapipe/framework/memory_manager_service.h"
 #include "mediapipe/framework/port/logging.h"
 #include "mediapipe/framework/port/status_macros.h"
 #include "mediapipe/framework/port/threadpool.h"
@@ -136,7 +138,9 @@ class CallbackHandler {
 }  // namespace internal
 
 Graph::Graph()
-    : executor_stack_size_increased_(false), global_java_packet_cls_(nullptr) {}
+    : executor_stack_size_increased_(false), global_java_packet_cls_(nullptr) {
+  SetServiceObject(kMemoryManagerService, std::make_shared<MemoryManager>());
+}
 
 Graph::~Graph() {
   if (running_graph_) {

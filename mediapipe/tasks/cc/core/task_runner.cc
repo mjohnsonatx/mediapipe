@@ -35,6 +35,8 @@ limitations under the License.
 #include "absl/synchronization/mutex.h"
 #include "mediapipe/framework/calculator.pb.h"
 #include "mediapipe/framework/calculator_framework.h"
+#include "mediapipe/framework/memory_manager.h"
+#include "mediapipe/framework/memory_manager_service.h"
 #include "mediapipe/framework/executor.h"
 #include "mediapipe/framework/port/status_macros.h"
 #include "mediapipe/framework/tool/name_util.h"
@@ -200,6 +202,10 @@ absl::Status TaskRunner::Initialize(
                                          model_resources_cache),
                  "ModelResourcesCacheService is not set up successfully.",
                  MediaPipeTasksStatus::kRunnerModelResourcesCacheServiceError));
+  if (!disable_default_service) {
+    ABSL_RETURN_IF_ERROR(graph_.SetServiceObject(
+        kMemoryManagerService, std::make_shared<MemoryManager>()));
+  }
   ABSL_RETURN_IF_ERROR(
       AddPayload(graph_.Initialize(std::move(config), *input_side_packets),
                  "MediaPipe CalculatorGraph is not successfully initialized.",

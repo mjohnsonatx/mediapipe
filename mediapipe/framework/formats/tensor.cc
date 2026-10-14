@@ -358,6 +358,9 @@ Tensor::OpenGlBufferView Tensor::GetOpenGlBufferReadView() const {
          "supported yet.";
   auto lock(std::make_unique<absl::MutexLock>(&view_mutex_));
   AllocateOpenGlBuffer();
+  if (pooled_buffer_ != nullptr && !gl_context_->IsCurrent()) {
+    pooled_buffer_->DisableReuse();
+  }
   if (!(valid_ & kValidOpenGlBuffer)) {
     // If the call succeeds then AHWB -> SSBO are synchronized so any usage of
     // the SSBO is correct after this call.
@@ -413,6 +416,9 @@ Tensor::OpenGlBufferView Tensor::GetOpenGlBufferWriteView(
            "behavior due to lack of synchronization.";
   }
   valid_ = kValidOpenGlBuffer;
+  if (pooled_buffer_ != nullptr && !gl_context_->IsCurrent()) {
+    pooled_buffer_->DisableReuse();
+  }
   return {/*is_write_view=*/true, opengl_buffer_,
           std::move(lock),
           /*ssbo_read=*/nullptr,  gl_context_.get(),
@@ -425,12 +431,21 @@ void Tensor::AllocateOpenGlBuffer() const {
       gl_context_ = mediapipe::GlContext::GetCurrent();
     }
     ABSL_LOG_IF(FATAL, !gl_context_) << "GlContext is not bound to the thread.";
-    glGenBuffers(1, &opengl_buffer_);
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, opengl_buffer_);
-    if (!use_ahwb_ || !AllocateAhwbMapToSsbo()) {
-      glBufferData(GL_SHADER_STORAGE_BUFFER, bytes(), NULL, GL_STREAM_COPY);
+    if (ssbo_pool_ != nullptr && !use_ahwb_) {
+      pooled_buffer_ = ssbo_pool_->GetBuffer(
+          {/*element_type=*/static_cast<int>(element_type_),
+           /*dimensions=*/{shape_.dims.begin(), shape_.dims.end()},
+           /*byte_size=*/bytes(),
+           /*context_id=*/reinterpret_cast<uintptr_t>(gl_context_.get())});
+      opengl_buffer_ = pooled_buffer_->GetOpenGlBuffer(gl_context_);
+    } else {
+      glGenBuffers(1, &opengl_buffer_);
+      glBindBuffer(GL_SHADER_STORAGE_BUFFER, opengl_buffer_);
+      if (!use_ahwb_ || !AllocateAhwbMapToSsbo()) {
+        glBufferData(GL_SHADER_STORAGE_BUFFER, bytes(), NULL, GL_STREAM_COPY);
+      }
+      glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
     }
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
   }
 }
 #endif  // MEDIAPIPE_OPENGL_ES_VERSION >= MEDIAPIPE_OPENGL_ES_31
@@ -455,6 +470,10 @@ void Tensor::Move(Tensor* src) {
   element_type_ = src->element_type();
   src->element_type_ = ElementType::kNone;  // Mark as invalidated.
   cpu_buffer_ = std::exchange(src->cpu_buffer_, nullptr);
+#if MEDIAPIPE_OPENGL_ES_VERSION >= MEDIAPIPE_OPENGL_ES_31
+  ssbo_pool_ = std::move(src->ssbo_pool_);
+  pooled_buffer_ = std::move(src->pooled_buffer_);
+#endif
   ahwb_tracking_key_ = src->ahwb_tracking_key_;
   mtl_resources_ = std::move(src->mtl_resources_);
   MoveAhwbStuff(src);
@@ -486,6 +505,11 @@ Tensor::Tensor(ElementType element_type, const Shape& shape,
       shape_(shape),
       memory_alignment_(memory_alignment),
       mtl_resources_(std::make_unique<MtlResources>()) {
+#if MEDIAPIPE_OPENGL_ES_VERSION >= MEDIAPIPE_OPENGL_ES_31
+  if (memory_manager != nullptr && !memory_manager->PreferAhwb()) {
+    ssbo_pool_ = memory_manager->GetTensorBufferPool();
+  }
+#endif
 #ifdef MEDIAPIPE_TENSOR_USE_AHWB
   if (memory_manager) {
     hardware_buffer_pool_ = memory_manager->GetAndroidHardwareBufferPool();
@@ -501,6 +525,11 @@ Tensor::Tensor(ElementType element_type, const Shape& shape,
       quantization_parameters_(quantization_parameters),
       memory_alignment_(memory_alignment),
       mtl_resources_(std::make_unique<MtlResources>()) {
+#if MEDIAPIPE_OPENGL_ES_VERSION >= MEDIAPIPE_OPENGL_ES_31
+  if (memory_manager != nullptr && !memory_manager->PreferAhwb()) {
+    ssbo_pool_ = memory_manager->GetTensorBufferPool();
+  }
+#endif
 #ifdef MEDIAPIPE_TENSOR_USE_AHWB
   if (memory_manager) {
     hardware_buffer_pool_ = memory_manager->GetAndroidHardwareBufferPool();
@@ -559,6 +588,9 @@ absl::Status Tensor::Invalidate() {
   GLuint cleanup_gl_buf = GL_INVALID_INDEX;
 #endif  // MEDIAPIPE_OPENGL_ES_VERSION >= MEDIAPIPE_OPENGL_ES_31
 #endif  // MEDIAPIPE_OPENGL_ES_VERSION >= MEDIAPIPE_OPENGL_ES_30
+#if MEDIAPIPE_OPENGL_ES_VERSION >= MEDIAPIPE_OPENGL_ES_31
+  std::shared_ptr<TensorBufferPool::Buffer> pooled_buffer;
+#endif
   {
     absl::MutexLock lock(view_mutex_);
     ABSL_RETURN_IF_ERROR(ReleaseAhwbStuff());
@@ -569,10 +601,31 @@ absl::Status Tensor::Invalidate() {
     std::swap(cleanup_gl_tex, opengl_texture2d_);
     std::swap(cleanup_gl_fb, frame_buffer_);
 #if MEDIAPIPE_OPENGL_ES_VERSION >= MEDIAPIPE_OPENGL_ES_31
-    std::swap(cleanup_gl_buf, opengl_buffer_);
+    if (pooled_buffer_ != nullptr) {
+      opengl_buffer_ = GL_INVALID_INDEX;
+      pooled_buffer = std::move(pooled_buffer_);
+    } else {
+      std::swap(cleanup_gl_buf, opengl_buffer_);
+    }
 #endif  // MEDIAPIPE_OPENGL_ES_VERSION >= MEDIAPIPE_OPENGL_ES_31
 #endif  // MEDIAPIPE_OPENGL_ES_VERSION >= MEDIAPIPE_OPENGL_ES_30
   }
+  // Return on the allocating context after its last submitted command. The
+  // context is part of the pool key, so reuse is ordered by that same GL queue
+  // without an additional per-buffer fence or CPU wait. Cross-context views
+  // disable reuse and keep the original driver-managed deletion lifetime.
+#if MEDIAPIPE_OPENGL_ES_VERSION >= MEDIAPIPE_OPENGL_ES_31
+  if (pooled_buffer != nullptr && pooled_buffer->has_opengl_buffer() &&
+      gl_context_ != nullptr) {
+    const std::shared_ptr<GlContext> context = gl_context_;
+    context->RunWithoutWaiting(
+        [pooled_buffer = std::move(pooled_buffer), context]() mutable {
+          pooled_buffer.reset();
+        });
+  } else {
+    pooled_buffer.reset();
+  }
+#endif
   // Do not hold the view mutex while invoking GlContext::RunWithoutWaiting,
   // since that method may acquire the context's own lock.
 #if MEDIAPIPE_OPENGL_ES_VERSION >= MEDIAPIPE_OPENGL_ES_31

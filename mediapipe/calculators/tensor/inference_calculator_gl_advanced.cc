@@ -30,6 +30,8 @@
 #include "mediapipe/framework/api2/packet.h"
 #include "mediapipe/framework/calculator_framework.h"
 #include "mediapipe/framework/formats/tensor.h"
+#include "mediapipe/framework/memory_manager.h"
+#include "mediapipe/framework/memory_manager_service.h"
 #include "mediapipe/framework/mediapipe_profiling.h"
 #include "mediapipe/framework/port/ret_check.h"
 #include "mediapipe/framework/port/status_macros.h"
@@ -93,6 +95,7 @@ class InferenceCalculatorGlAdvancedImpl
     InferenceOnDiskCacheHelper on_disk_cache_helper_;
 
     InputOutputTensorNames input_output_tensor_names_;
+    MemoryManager* memory_manager_ = nullptr;
   };
 
   absl::StatusOr<std::vector<Tensor>> Process(
@@ -118,6 +121,9 @@ InferenceCalculatorGlAdvancedImpl::GpuInferenceRunner::~GpuInferenceRunner() {
 absl::Status InferenceCalculatorGlAdvancedImpl::GpuInferenceRunner::Init(
     CalculatorContext* cc, std::shared_ptr<GlContext> gl_context) {
   initialization_gl_context_ = gl_context;
+  if (cc->Service(kMemoryManagerService).IsAvailable()) {
+    memory_manager_ = &cc->Service(kMemoryManagerService).GetObject();
+  }
   const auto& options = cc->Options<mediapipe::InferenceCalculatorOptions>();
 
   mediapipe::InferenceCalculatorOptions::Delegate delegate = options.delegate();
@@ -152,7 +158,7 @@ InferenceCalculatorGlAdvancedImpl::GpuInferenceRunner::Run(
   output_tensors.reserve(output_shapes_.size());
   for (int i = 0; i < output_shapes_.size(); ++i) {
     output_tensors.emplace_back(Tensor::ElementType::kFloat32,
-                                output_shapes_[i]);
+                                output_shapes_[i], memory_manager_);
     ABSL_RETURN_IF_ERROR(tflite_gpu_runner_->BindSSBOToOutputTensor(
         output_tensors.back().GetOpenGlBufferWriteView().name(), i));
   }
@@ -263,6 +269,7 @@ absl::Status InferenceCalculatorGlAdvancedImpl::UpdateContract(
       << "Either model as side packet or model path in options is required.";
 
   WarnFeedbackTensorsUnsupported(cc);
+  cc->UseService(kMemoryManagerService).Optional();
   ABSL_RETURN_IF_ERROR(mediapipe::GlCalculatorHelper::UpdateContract(cc));
   return absl::OkStatus();
 }

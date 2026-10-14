@@ -568,6 +568,12 @@ class Tensor {
   mutable absl::Mutex view_mutex_;
 
   mutable void* cpu_buffer_ = nullptr;
+#if MEDIAPIPE_OPENGL_ES_VERSION >= MEDIAPIPE_OPENGL_ES_31
+  // Lease only when an SSBO is requested; CPU-only tensors do not enter the
+  // pool. CPU backing remains owned by this Tensor, not by the SSBO lease.
+  std::shared_ptr<TensorBufferPool> ssbo_pool_;
+  mutable std::shared_ptr<TensorBufferPool::Buffer> pooled_buffer_;
+#endif
   absl::Status AllocateCpuBuffer() const;
   void FreeCpuBuffer() const;
   // Forward declaration of the MtlResources provides compile-time verification

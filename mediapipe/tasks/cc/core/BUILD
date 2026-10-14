@@ -288,6 +288,8 @@ cc_library_with_tflite(
         "//mediapipe/framework:calculator_cc_proto",
         "//mediapipe/framework:calculator_framework",
         "//mediapipe/framework:executor",
+        "//mediapipe/framework:memory_manager",
+        "//mediapipe/framework:memory_manager_service",
         "//mediapipe/framework/port:status",
         "//mediapipe/framework/tool:name_util",
         "//mediapipe/gpu:gpu_shared_data_internal",
