@@ -17,7 +17,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <map>
 #include <memory>
 #include <vector>
 
@@ -52,8 +51,10 @@ struct TensorBufferSpec {
 // CPU backing and GPU-to-CPU readback retain their original allocation path.
 // Defaults retain at most two buffers per shape and ten idle shape keys. In-use
 // leases are never evicted; temporary overflow drains when those leases return.
-class TensorBufferPool
-    : public std::enable_shared_from_this<TensorBufferPool> {
+// Each GL context exclusively owns its shape map and free lists. The only pool
+// mutex registers new context owners; borrowing/returning on a registered owner
+// does not acquire it. The key budget is shared, not multiplied per context.
+class TensorBufferPool {
  public:
   class Buffer {
    public:
@@ -84,28 +85,31 @@ class TensorBufferPool
   };
 
   explicit TensorBufferPool(
-      MultiPoolOptions options = kDefaultMultiPoolOptions)
-      : options_(options) {}
+      MultiPoolOptions options = kDefaultMultiPoolOptions);
+  ~TensorBufferPool();
 
-  // Returns an exclusive lease. Releasing the shared_ptr returns the backing
-  // to this pool, up to keep_count entries for the exact shape key.
-  std::shared_ptr<Buffer> GetBuffer(const TensorBufferSpec& spec);
+#if MEDIAPIPE_OPENGL_ES_VERSION >= MEDIAPIPE_OPENGL_ES_31
+  // Must be called with current_context current. The last lease may be released
+  // on any thread: its deleter routes bookkeeping back to that context. A lease
+  // outliving this pool deletes its backing instead of accessing retired state.
+  std::shared_ptr<Buffer> GetBuffer(
+      const TensorBufferSpec& spec,
+      const std::shared_ptr<GlContext>& current_context);
+#endif
 
  private:
-  struct Entry {
-    int in_use = 0;
-    uint64_t last_use = 0;
-    std::vector<std::unique_ptr<Buffer>> available;
-  };
-
-  void Return(const TensorBufferSpec& spec, std::unique_ptr<Buffer> buffer);
-  void EvictUnusedEntries(std::vector<std::unique_ptr<Buffer>>* evicted)
-      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
-
   const MultiPoolOptions options_;
-  absl::Mutex mutex_;
-  uint64_t use_sequence_ ABSL_GUARDED_BY(mutex_) = 0;
-  std::map<TensorBufferSpec, Entry> entries_ ABSL_GUARDED_BY(mutex_);
+#if MEDIAPIPE_OPENGL_ES_VERSION >= MEDIAPIPE_OPENGL_ES_31
+  struct KeyBudget;
+  class ContextPool;
+  const uint64_t pool_id_;
+  std::shared_ptr<KeyBudget> key_budget_;
+  // Cold registration only. Context caches hold non-owning pointers, so they
+  // cannot form a GlContext -> pool -> GlContext ownership cycle.
+  absl::Mutex registration_mutex_;
+  std::vector<std::shared_ptr<ContextPool>> context_pools_
+      ABSL_GUARDED_BY(registration_mutex_);
+#endif
 };
 
 }  // namespace mediapipe

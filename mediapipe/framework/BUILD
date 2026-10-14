@@ -1978,12 +1978,14 @@ cc_library(
 cc_test(
     name = "tensor_buffer_pool_test",
     srcs = ["tensor_buffer_pool_test.cc"],
+    linkstatic = True,
     deps = [
         ":memory_manager",
         "//mediapipe/framework/port:gtest_main",
         "//mediapipe/gpu:gl_base",
         "//mediapipe/gpu:gl_context",
         "//mediapipe/gpu:multi_pool",
+        "@com_google_absl//absl/synchronization",
     ],
 )
 

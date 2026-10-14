@@ -436,7 +436,8 @@ void Tensor::AllocateOpenGlBuffer() const {
           {/*element_type=*/static_cast<int>(element_type_),
            /*dimensions=*/{shape_.dims.begin(), shape_.dims.end()},
            /*byte_size=*/bytes(),
-           /*context_id=*/reinterpret_cast<uintptr_t>(gl_context_.get())});
+           /*context_id=*/reinterpret_cast<uintptr_t>(gl_context_.get())},
+          gl_context_);
       opengl_buffer_ = pooled_buffer_->GetOpenGlBuffer(gl_context_);
     } else {
       glGenBuffers(1, &opengl_buffer_);
