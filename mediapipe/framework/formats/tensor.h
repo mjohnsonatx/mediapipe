@@ -570,9 +570,10 @@ class Tensor {
   mutable void* cpu_buffer_ = nullptr;
 #if MEDIAPIPE_OPENGL_ES_VERSION >= MEDIAPIPE_OPENGL_ES_31
   // Lease only when an SSBO is requested; CPU-only tensors do not enter the
-  // pool. CPU backing remains owned by this Tensor, not by the SSBO lease.
+  // pool. Once leased, lazily allocated CPU backing shares its lifetime.
   std::shared_ptr<TensorBufferPool> ssbo_pool_;
   mutable std::shared_ptr<TensorBufferPool::Buffer> pooled_buffer_;
+  mutable bool cpu_buffer_is_pooled_ = false;
 #endif
   absl::Status AllocateCpuBuffer() const;
   void FreeCpuBuffer() const;

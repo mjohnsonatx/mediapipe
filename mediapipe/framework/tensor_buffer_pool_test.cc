@@ -6,6 +6,7 @@
 
 #include "mediapipe/framework/tensor_buffer_pool.h"
 
+#include <cstdlib>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -45,7 +46,8 @@ class TensorBufferPoolTest : public testing::Test {
     lease->reset();
   }
 
-  TensorBufferSpec spec_{/*element_type=*/1, /*dimensions=*/{1, 4}, /*byte_size=*/16};
+  TensorBufferSpec spec_{/*element_type=*/1, /*dimensions=*/{1, 4},
+                         /*byte_size=*/16};
   std::shared_ptr<GlContext> context_;
   std::shared_ptr<TensorBufferPool> pool_;
 };
@@ -61,6 +63,60 @@ TEST_F(TensorBufferPoolTest, ReusesSsboWithoutAliasingActiveLease) {
     EXPECT_TRUE(glIsBuffer(b));
     Return(&second);
     Return(&reused);
+  });
+}
+
+TEST_F(TensorBufferPoolTest, ReusesCpuBackingWithItsSsboLease) {
+  context_->Run([this] {
+    std::shared_ptr<TensorBufferPool::Buffer> first, reused;
+    const GLuint name = Acquire(spec_, &first);
+    void* cpu_buffer = first->GetCpuBuffer();
+    ASSERT_NE(cpu_buffer, nullptr);
+    Return(&first);
+
+    EXPECT_EQ(Acquire(spec_, &reused), name);
+    EXPECT_EQ(reused->GetCpuBuffer(), cpu_buffer);
+    Return(&reused);
+  });
+}
+
+TEST_F(TensorBufferPoolTest, AdoptsCpuFirstAllocationIntoLease) {
+  context_->Run([this] {
+    std::shared_ptr<TensorBufferPool::Buffer> first, reused;
+    Acquire(spec_, &first);
+    void* cpu_buffer = malloc(spec_.byte_size);
+    ASSERT_NE(cpu_buffer, nullptr);
+    ASSERT_TRUE(first->AdoptCpuBuffer(cpu_buffer));
+    Return(&first);
+
+    Acquire(spec_, &reused);
+    EXPECT_EQ(reused->GetCpuBuffer(), cpu_buffer);
+    Return(&reused);
+  });
+}
+
+TEST_F(TensorBufferPoolTest, ActiveLeasesDoNotAliasCpuBacking) {
+  context_->Run([this] {
+    std::shared_ptr<TensorBufferPool::Buffer> first, second;
+    Acquire(spec_, &first);
+    Acquire(spec_, &second);
+    EXPECT_NE(first->GetCpuBuffer(), second->GetCpuBuffer());
+    Return(&first);
+    Return(&second);
+  });
+}
+
+TEST_F(TensorBufferPoolTest, CpuAlignmentIsPartOfPoolKey) {
+  context_->Run([this] {
+    auto aligned_spec = spec_;
+    aligned_spec.memory_alignment = 64;
+    std::shared_ptr<TensorBufferPool::Buffer> aligned, unaligned;
+    const GLuint aligned_name = Acquire(aligned_spec, &aligned);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(aligned->GetCpuBuffer()) % 64, 0);
+    Return(&aligned);
+
+    EXPECT_NE(Acquire(spec_, &unaligned), aligned_name);
+    Return(&unaligned);
   });
 }
 

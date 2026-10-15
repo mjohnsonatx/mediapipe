@@ -10,24 +10,32 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <map>
 #include <tuple>
 #include <utility>
 
 #include "absl/log/absl_check.h"
+#include "mediapipe/framework/port/aligned_malloc_and_free.h"
 
 namespace mediapipe {
 
 bool TensorBufferSpec::operator<(const TensorBufferSpec& other) const {
-  return std::tie(element_type, dimensions, byte_size, context_id) <
+  return std::tie(element_type, dimensions, byte_size, memory_alignment,
+                  context_id) <
          std::tie(other.element_type, other.dimensions, other.byte_size,
-                  other.context_id);
+                  other.memory_alignment, other.context_id);
 }
 
 TensorBufferPool::Buffer::Buffer(TensorBufferSpec spec)
     : spec_(std::move(spec)) {}
 
 TensorBufferPool::Buffer::~Buffer() {
+  if (spec_.memory_alignment > 0) {
+    aligned_free(cpu_buffer_);
+  } else {
+    free(cpu_buffer_);
+  }
 #if MEDIAPIPE_OPENGL_ES_VERSION >= MEDIAPIPE_OPENGL_ES_31
   GLuint buffer = std::exchange(opengl_buffer_, GL_INVALID_INDEX);
   if (buffer != GL_INVALID_INDEX && gl_context_ != nullptr) {
@@ -38,6 +46,28 @@ TensorBufferPool::Buffer::~Buffer() {
     }
   }
 #endif
+}
+
+void* TensorBufferPool::Buffer::GetCpuBuffer() {
+  if (cpu_buffer_ == nullptr) {
+    if (spec_.memory_alignment > 0) {
+      cpu_buffer_ = aligned_malloc(
+          std::max(spec_.memory_alignment, spec_.byte_size),
+          spec_.memory_alignment);
+    } else {
+      cpu_buffer_ = malloc(spec_.byte_size);
+    }
+    ABSL_CHECK(cpu_buffer_ != nullptr)
+        << "Failed to allocate Tensor CPU buffer.";
+  }
+  return cpu_buffer_;
+}
+
+bool TensorBufferPool::Buffer::AdoptCpuBuffer(void* cpu_buffer) {
+  ABSL_CHECK(cpu_buffer != nullptr);
+  if (cpu_buffer_ != nullptr) return false;
+  cpu_buffer_ = cpu_buffer;
+  return true;
 }
 
 #if MEDIAPIPE_OPENGL_ES_VERSION >= MEDIAPIPE_OPENGL_ES_31

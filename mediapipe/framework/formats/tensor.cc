@@ -436,9 +436,21 @@ void Tensor::AllocateOpenGlBuffer() const {
           {/*element_type=*/static_cast<int>(element_type_),
            /*dimensions=*/{shape_.dims.begin(), shape_.dims.end()},
            /*byte_size=*/bytes(),
+           /*memory_alignment=*/memory_alignment_,
            /*context_id=*/reinterpret_cast<uintptr_t>(gl_context_.get())},
           gl_context_);
       opengl_buffer_ = pooled_buffer_->GetOpenGlBuffer(gl_context_);
+      if (cpu_buffer_ != nullptr && !cpu_buffer_is_pooled_) {
+        if (pooled_buffer_->AdoptCpuBuffer(cpu_buffer_)) {
+          cpu_buffer_is_pooled_ = true;
+        } else {
+          void* pooled_cpu_buffer = pooled_buffer_->GetCpuBuffer();
+          std::memcpy(pooled_cpu_buffer, cpu_buffer_, bytes());
+          FreeCpuBuffer();
+          cpu_buffer_ = pooled_cpu_buffer;
+          cpu_buffer_is_pooled_ = true;
+        }
+      }
     } else {
       glGenBuffers(1, &opengl_buffer_);
       glBindBuffer(GL_SHADER_STORAGE_BUFFER, opengl_buffer_);
@@ -474,6 +486,7 @@ void Tensor::Move(Tensor* src) {
 #if MEDIAPIPE_OPENGL_ES_VERSION >= MEDIAPIPE_OPENGL_ES_31
   ssbo_pool_ = std::move(src->ssbo_pool_);
   pooled_buffer_ = std::move(src->pooled_buffer_);
+  cpu_buffer_is_pooled_ = std::exchange(src->cpu_buffer_is_pooled_, false);
 #endif
   ahwb_tracking_key_ = src->ahwb_tracking_key_;
   mtl_resources_ = std::move(src->mtl_resources_);
@@ -603,6 +616,10 @@ absl::Status Tensor::Invalidate() {
     std::swap(cleanup_gl_fb, frame_buffer_);
 #if MEDIAPIPE_OPENGL_ES_VERSION >= MEDIAPIPE_OPENGL_ES_31
     if (pooled_buffer_ != nullptr) {
+      if (cpu_buffer_is_pooled_) {
+        cpu_buffer_ = nullptr;
+        cpu_buffer_is_pooled_ = false;
+      }
       opengl_buffer_ = GL_INVALID_INDEX;
       pooled_buffer = std::move(pooled_buffer_);
     } else {
@@ -835,6 +852,13 @@ absl::Status Tensor::AllocateCpuBuffer() const {
 #ifdef MEDIAPIPE_TENSOR_USE_AHWB
     if (use_ahwb_ && AllocateAHardwareBuffer().ok()) return absl::OkStatus();
 #endif  // MEDIAPIPE_TENSOR_USE_AHWB
+#if MEDIAPIPE_OPENGL_ES_VERSION >= MEDIAPIPE_OPENGL_ES_31
+    if (pooled_buffer_ != nullptr) {
+      cpu_buffer_ = pooled_buffer_->GetCpuBuffer();
+      cpu_buffer_is_pooled_ = true;
+      return absl::OkStatus();
+    }
+#endif
 #if MEDIAPIPE_METAL_ENABLED
     // AllocateVirtualMemory allocates memory aligned to the size of a virtual
     // memory page which should match common alignment requirements.
@@ -859,6 +883,13 @@ void Tensor::FreeCpuBuffer() const {
   if (cpu_buffer_ == nullptr) {
     return;
   }
+#if MEDIAPIPE_OPENGL_ES_VERSION >= MEDIAPIPE_OPENGL_ES_31
+  if (cpu_buffer_is_pooled_) {
+    cpu_buffer_ = nullptr;
+    cpu_buffer_is_pooled_ = false;
+    return;
+  }
+#endif
 #if MEDIAPIPE_METAL_ENABLED
   free(cpu_buffer_);
 #else

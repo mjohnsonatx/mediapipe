@@ -37,18 +37,23 @@ namespace mediapipe {
 // topology changes cannot accidentally share a differently shaped allocation.
 struct TensorBufferSpec {
   int element_type = 0;
-  // Tensor shapes in MediaPipe are normally rank <= 4. Keeping the shape inline avoids replacing
-  // the large SSBO allocation with a small heap allocation on every pool lease.
+  // Tensor shapes in MediaPipe are normally rank <= 4. Keeping the shape
+  // inline avoids replacing the large backing allocation with a small heap
+  // allocation on every pool lease.
   absl::InlinedVector<int, 4> dimensions;
   int byte_size = 0;
-  // Reuse only on the allocating context, never across unrelated GL share groups.
+  // CPU custom allocations can require stronger alignment than malloc.
+  // Alignment is part of the key so pooled host memory remains compatible.
+  int memory_alignment = 0;
+  // Reuse only on the allocating context, never across unrelated GL share
+  // groups.
   uintptr_t context_id = 0;
 
   bool operator<(const TensorBufferSpec& other) const;
 };
 
-// A bounded, shape-keyed pool for Tensor OpenGL shader-storage buffers only.
-// CPU backing and GPU-to-CPU readback retain their original allocation path.
+// A bounded, shape-keyed pool for Tensor OpenGL shader-storage buffers and
+// their lazily allocated CPU backing.
 // Defaults retain at most two buffers per shape and ten idle shape keys. In-use
 // leases are never evicted; temporary overflow drains when those leases return.
 // Each GL context exclusively owns its shape map and free lists. The only pool
@@ -62,6 +67,13 @@ class TensorBufferPool {
     Buffer(const Buffer&) = delete;
     Buffer& operator=(const Buffer&) = delete;
     ~Buffer();
+
+    // Returns host backing compatible with this buffer's size and alignment.
+    // It is allocated only when a CPU view is actually requested.
+    void* GetCpuBuffer();
+    // Transfers an existing compatible allocation into an otherwise empty
+    // pooled backing. Returns false without taking ownership if backing exists.
+    bool AdoptCpuBuffer(void* cpu_buffer);
 
 #if MEDIAPIPE_OPENGL_ES_VERSION >= MEDIAPIPE_OPENGL_ES_31
     GLuint GetOpenGlBuffer(const std::shared_ptr<GlContext>& current_context);
@@ -77,6 +89,7 @@ class TensorBufferPool {
    private:
     TensorBufferSpec spec_;
     bool reusable_ = true;
+    void* cpu_buffer_ = nullptr;
 
 #if MEDIAPIPE_OPENGL_ES_VERSION >= MEDIAPIPE_OPENGL_ES_31
     GLuint opengl_buffer_ = GL_INVALID_INDEX;

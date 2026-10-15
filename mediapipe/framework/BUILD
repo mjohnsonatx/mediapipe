@@ -1951,6 +1951,7 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":port",
+        "//mediapipe/framework/port:aligned_malloc_and_free",
         "//mediapipe/gpu:gl_base",
         "//mediapipe/gpu:gl_context",
         "//mediapipe/gpu:multi_pool",
