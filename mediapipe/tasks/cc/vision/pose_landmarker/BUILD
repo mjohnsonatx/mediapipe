@@ -176,6 +176,26 @@ cc_library(
 )
 
 cc_test(
+    name = "pose_landmarker_video_sync_test",
+    srcs = ["pose_landmarker_video_sync_test.cc"],
+    linkstatic = True,
+    # Supply POSE_LANDMARKER_TEST_MODEL with a .task bundle on the test host.
+    tags = ["manual"],
+    deps = [
+        ":pose_landmarker_graph",
+        "//mediapipe/framework:calculator_framework",
+        "//mediapipe/framework/api2:builder",
+        "//mediapipe/framework/formats:image",
+        "//mediapipe/framework/formats:image_format_cc_proto",
+        "//mediapipe/framework/formats:image_frame",
+        "//mediapipe/framework/formats:rect_cc_proto",
+        "//mediapipe/framework/port:gtest_main",
+        "//mediapipe/framework/tool:sink",
+        "//mediapipe/tasks/cc/vision/pose_landmarker/proto:pose_landmarker_graph_options_cc_proto",
+    ],
+)
+
+cc_test(
     name = "pose_landmarker_graph_test",
     srcs = ["pose_landmarker_graph_test.cc"],
     data = [

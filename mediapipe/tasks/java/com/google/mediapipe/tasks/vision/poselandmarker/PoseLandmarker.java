@@ -101,10 +101,7 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
 
   private static final int LANDMARKS_OUT_STREAM_INDEX = 0;
   private static final int WORLD_LANDMARKS_OUT_STREAM_INDEX = 1;
-  private static final int IMAGE_OUT_STREAM_INDEX = 2;
-  private static final int POSE_RECTS_NEXT_FRAME_OUT_STREAM_INDEX = 3;
-  private static final int POSE_DETECTIONS_OUT_STREAM_INDEX = 4;
-  private static int segmentationMasksOutStreamIndex = -1;
+  private static final int OMITTED_OUT_STREAM_INDEX = -1;
   private static final String TASK_GRAPH_NAME =
       "mediapipe.tasks.vision.pose_landmarker.PoseLandmarkerGraph";
 
@@ -206,12 +203,28 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
     List<String> outputStreams = new ArrayList<>();
     outputStreams.add("NORM_LANDMARKS:pose_landmarks");
     outputStreams.add("WORLD_LANDMARKS:world_landmarks");
-    outputStreams.add("IMAGE:image_out");
+    // Synchronous VIDEO returns only the task result. A lightweight bool packet keeps the
+    // multi-stream callback live even when every semantic result stream is empty, without retaining
+    // the input Image/TextureFrame through output synchronization. IMAGE keeps its established
+    // graph surface, and LIVE_STREAM requires image_out for its ResultListener input callback.
+    final int imageOutStreamIndex;
+    if (landmarkerOptions.runningMode() == RunningMode.VIDEO) {
+      imageOutStreamIndex = OMITTED_OUT_STREAM_INDEX;
+      outputStreams.add("VIDEO_SYNC:video_sync");
+    } else {
+      imageOutStreamIndex = outputStreams.size();
+      outputStreams.add("IMAGE:image_out");
+    }
+    final int poseRectsNextFrameOutStreamIndex = outputStreams.size();
     outputStreams.add("POSE_RECTS_NEXT_FRAME:pose_rects_next_frame");
+    final int poseDetectionsOutStreamIndex = outputStreams.size();
     outputStreams.add("DETECTIONS:pose_detections");
+    final int segmentationMasksOutStreamIndex;
     if (landmarkerOptions.outputSegmentationMasks()) {
+      segmentationMasksOutStreamIndex = outputStreams.size();
       outputStreams.add("SEGMENTATION_MASK:segmentation_masks");
-      segmentationMasksOutStreamIndex = outputStreams.size() - 1;
+    } else {
+      segmentationMasksOutStreamIndex = OMITTED_OUT_STREAM_INDEX;
     }
 
     // TODO: Consolidate OutputHandler and TaskRunner.
@@ -226,7 +239,7 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
                   new ArrayList<>(),
                   new ArrayList<>(),
                   new ArrayList<>(),
-                  !packets.get(POSE_DETECTIONS_OUT_STREAM_INDEX).isEmpty(),
+                  !packets.get(poseDetectionsOutStreamIndex).isEmpty(),
                   Optional.empty(),
                   BaseVisionTaskApi.generateResultTimestampMs(
                       landmarkerOptions.runningMode(), packets.get(LANDMARKS_OUT_STREAM_INDEX)));
@@ -234,7 +247,7 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
             /** Get segmentation masks */
             Optional<List<MPImage>> segmentedMasks = Optional.empty();
             if (landmarkerOptions.outputSegmentationMasks()) {
-              segmentedMasks = getSegmentationMasks(packets);
+              segmentedMasks = getSegmentationMasks(packets, segmentationMasksOutStreamIndex);
             }
 
             return PoseLandmarkerResult.create(
@@ -242,12 +255,12 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
                     packets.get(LANDMARKS_OUT_STREAM_INDEX), NormalizedLandmarkList.parser()),
                 PacketGetter.getProtoVector(
                     packets.get(WORLD_LANDMARKS_OUT_STREAM_INDEX), LandmarkList.parser()),
-                packets.get(POSE_RECTS_NEXT_FRAME_OUT_STREAM_INDEX).isEmpty()
+                packets.get(poseRectsNextFrameOutStreamIndex).isEmpty()
                     ? new ArrayList<>()
                     : PacketGetter.getProtoVector(
-                        packets.get(POSE_RECTS_NEXT_FRAME_OUT_STREAM_INDEX),
+                        packets.get(poseRectsNextFrameOutStreamIndex),
                         RectProto.NormalizedRect.parser()),
-                !packets.get(POSE_DETECTIONS_OUT_STREAM_INDEX).isEmpty(),
+                !packets.get(poseDetectionsOutStreamIndex).isEmpty(),
                 segmentedMasks,
                 BaseVisionTaskApi.generateResultTimestampMs(
                     landmarkerOptions.runningMode(), packets.get(LANDMARKS_OUT_STREAM_INDEX)));
@@ -255,8 +268,12 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
 
           @Override
           public MPImage convertToTaskInput(List<Packet> packets) {
+            if (imageOutStreamIndex == OMITTED_OUT_STREAM_INDEX) {
+              throw new IllegalStateException(
+                  "Synchronous VIDEO mode does not expose the pass-through input image.");
+            }
             return new BitmapImageBuilder(
-                    AndroidPacketGetter.getBitmap(packets.get(IMAGE_OUT_STREAM_INDEX)))
+                    AndroidPacketGetter.getBitmap(packets.get(imageOutStreamIndex)))
                 .build();
           }
         });
@@ -926,7 +943,8 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
     }
   }
 
-  private static Optional<List<MPImage>> getSegmentationMasks(List<Packet> packets) {
+  private static Optional<List<MPImage>> getSegmentationMasks(
+      List<Packet> packets, int segmentationMasksOutStreamIndex) {
     Optional<List<MPImage>> segmentedMasks = Optional.of(new ArrayList<>());
     int width =
         PacketGetter.getImageWidthFromImageList(packets.get(segmentationMasksOutStreamIndex));

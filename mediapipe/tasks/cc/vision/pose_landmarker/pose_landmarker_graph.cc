@@ -76,6 +76,7 @@ constexpr char kExternalSourceImageSizeTag[] = "EXTERNAL_SOURCE_IMAGE_SIZE";
 constexpr char kUseExternalSourceProjectionTag[] =
     "USE_EXTERNAL_SOURCE_PROJECTION";
 constexpr char kResetTrackingTag[] = "RESET_TRACKING";
+constexpr char kVideoSyncTag[] = "VIDEO_SYNC";
 constexpr char kNormLandmarksTag[] = "NORM_LANDMARKS";
 constexpr char kWorldLandmarksTag[] = "WORLD_LANDMARKS";
 constexpr char kAuxiliaryLandmarksTag[] = "AUXILIARY_LANDMARKS";
@@ -99,7 +100,7 @@ struct PoseLandmarkerOutputs {
   Source<std::vector<NormalizedRect>> pose_rects_next_frame;
   Source<std::vector<Detection>> pose_detections;
   std::optional<Source<std::vector<Image>>> segmentation_masks;
-  Source<Image> image;
+  std::optional<Source<Image>> image;
 };
 
 // Sets the base options in the sub tasks.
@@ -216,6 +217,9 @@ absl::Status SetSubTaskBaseOptions(const ModelAssetBundleResources& resources,
 //   IMAGE - Image
 //     The input image that the pose landmarker runs on and has the pixel data
 //     stored on the target storage (CPU vs GPU).
+//   VIDEO_SYNC - bool @Optional
+//     Lightweight per-frame packet used by synchronous VIDEO clients to make
+//     empty semantic output sets observable without passing IMAGE through.
 // All returned coordinates are in the unrotated and uncropped input image
 // coordinates system.
 //
@@ -264,6 +268,9 @@ class PoseLandmarkerGraph : public core::ModelTaskGraph {
     Graph graph;
     bool output_segmentation_masks =
         HasOutput(sc->OriginalNode(), kSegmentationMaskTag);
+    const bool output_image = HasOutput(sc->OriginalNode(), kImageTag);
+    const bool output_video_sync =
+        HasOutput(sc->OriginalNode(), kVideoSyncTag);
     if (sc->Options<PoseLandmarkerGraphOptions>()
             .base_options()
             .has_model_asset()) {
@@ -325,6 +332,18 @@ class PoseLandmarkerGraph : public core::ModelTaskGraph {
     if (HasInput(sc->OriginalNode(), kResetTrackingTag)) {
       reset_tracking_in = graph.In(kResetTrackingTag).Cast<bool>();
     }
+    if (output_video_sync) {
+      if (!reset_tracking_in) {
+        return absl::InvalidArgumentError(
+            "VIDEO_SYNC requires the per-frame RESET_TRACKING input.");
+      }
+      // Keep separate internal names for the input and output. Subgraph expansion
+      // maps them to different parent streams; aliasing one stream at both ports
+      // would rename the reset gate's input to the unproduced VIDEO_SYNC output.
+      auto& video_sync = graph.AddNode("PassThroughCalculator");
+      *reset_tracking_in >> video_sync.In("");
+      video_sync.Out("").Cast<bool>() >> graph[Output<bool>(kVideoSyncTag)];
+    }
     ABSL_ASSIGN_OR_RETURN(
         auto outs, BuildPoseLandmarkerGraph(
                        *sc->MutableOptions<PoseLandmarkerGraphOptions>(),
@@ -334,7 +353,8 @@ class PoseLandmarkerGraph : public core::ModelTaskGraph {
                        external_source_projection_rect_in,
                        external_source_image_size_in,
                        use_external_source_projection_in,
-                       reset_tracking_in, graph, output_segmentation_masks));
+                       reset_tracking_in, graph, output_segmentation_masks,
+                       output_image));
     outs.landmark_lists >>
         graph[Output<std::vector<NormalizedLandmarkList>>(kNormLandmarksTag)];
     outs.world_landmark_lists >>
@@ -346,7 +366,9 @@ class PoseLandmarkerGraph : public core::ModelTaskGraph {
         graph[Output<std::vector<NormalizedRect>>(kPoseRectsNextFrameTag)];
     outs.pose_detections >>
         graph[Output<std::vector<Detection>>(kDetectionsTag)];
-    outs.image >> graph[Output<Image>(kImageTag)];
+    if (outs.image) {
+      *outs.image >> graph[Output<Image>(kImageTag)];
+    }
     if (outs.segmentation_masks) {
       *outs.segmentation_masks >>
           graph[Output<std::vector<Image>>(kSegmentationMaskTag)];
@@ -374,7 +396,7 @@ class PoseLandmarkerGraph : public core::ModelTaskGraph {
       std::optional<Source<std::pair<int, int>>> external_source_image_size_in,
       std::optional<Source<bool>> use_external_source_projection_in,
       std::optional<Source<bool>> reset_tracking_in, Graph& graph,
-      bool output_segmentation_masks) {
+      bool output_segmentation_masks, bool output_image) {
     const int max_num_poses =
         tasks_options.pose_detector_graph_options().num_poses();
 
@@ -524,10 +546,14 @@ class PoseLandmarkerGraph : public core::ModelTaskGraph {
       pose_rects >> clip_pose_rects.In("");
     }
 
-    // TODO: Replace PassThroughCalculator with a calculator that
-    // converts the pixel data to be stored on the target storage (CPU vs GPU).
-    auto& pass_through = graph.AddNode("PassThroughCalculator");
-    image_in >> pass_through.In("");
+    std::optional<Source<Image>> image_out;
+    if (output_image) {
+      // TODO: Replace PassThroughCalculator with a calculator that
+      // converts the pixel data to be stored on the target storage (CPU vs GPU).
+      auto& pass_through = graph.AddNode("PassThroughCalculator");
+      image_in >> pass_through.In("");
+      image_out = pass_through[Output<Image>("")];
+    }
 
     return {{
         /* landmark_lists= */ landmarks,
@@ -537,8 +563,7 @@ class PoseLandmarkerGraph : public core::ModelTaskGraph {
         /* pose_detections */
         pose_detector.Out(kDetectionsTag).Cast<std::vector<Detection>>(),
         /* segmentation_masks= */ segmentation_masks,
-        /* image= */
-        pass_through[Output<Image>("")],
+        /* image= */ image_out,
     }};
   }
 };
