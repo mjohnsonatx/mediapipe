@@ -144,6 +144,15 @@ public abstract class BaseOptions {
     /** Options for GPU. */
     @AutoValue
     public abstract static class GpuOptions extends DelegateOptions {
+      /** Requested GPU inference API. AUTO lets the delegate choose an available backend. */
+      public enum GpuBackend {
+        AUTO,
+        OPENGL,
+        OPENCL
+      }
+
+      public abstract GpuBackend gpuBackend();
+
       // Load pre-compiled serialized binary cache to accelerate init process.
       // Only available on Android. Kernel caching will only be enabled if this
       // path is set. NOTE: binary cache usage may be skipped if valid serialized
@@ -163,12 +172,16 @@ public abstract class BaseOptions {
       abstract Optional<String> modelToken();
 
       public static Builder builder() {
-        return new AutoValue_BaseOptions_DelegateOptions_GpuOptions.Builder();
+        return new AutoValue_BaseOptions_DelegateOptions_GpuOptions.Builder()
+            .setGpuBackend(GpuBackend.AUTO);
       }
 
       /** Builder for {@link GpuOptions}. */
       @AutoValue.Builder
       public abstract static class Builder {
+        /** A forced backend fails initialization if unavailable; it never silently selects another API. */
+        public abstract Builder setGpuBackend(GpuBackend gpuBackend);
+
         public abstract Builder setCachedKernelPath(String cachedKernelPath);
 
         public abstract Builder setSerializedModelDir(String serializedModelDir);

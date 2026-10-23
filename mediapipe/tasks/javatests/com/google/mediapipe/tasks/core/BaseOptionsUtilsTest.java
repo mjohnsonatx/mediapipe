@@ -71,6 +71,31 @@ public class BaseOptionsUtilsTest {
   }
 
   @Test
+  public void gpuBackendDefaultsToAutomaticAndSurvivesSerialization() {
+    assertThat(BaseOptions.DelegateOptions.GpuOptions.builder().build().gpuBackend())
+        .isEqualTo(BaseOptions.DelegateOptions.GpuOptions.GpuBackend.AUTO);
+    for (BaseOptions.DelegateOptions.GpuOptions.GpuBackend backend
+        : BaseOptions.DelegateOptions.GpuOptions.GpuBackend.values()) {
+      BaseOptions options = BaseOptions.builder().setModelAssetPath(MODEL_ASSET_PATH)
+          .setDelegate(Delegate.GPU)
+          .setDelegateOptions(BaseOptions.DelegateOptions.GpuOptions.builder()
+              .setGpuBackend(backend).setModelToken(MODEL_TOKEN)
+              .setCachedKernelPath(CACHED_KERNEL_PATH)
+              .setSerializedModelDir(SERIALIZED_MODEL_DIR).build()).build();
+      com.google.mediapipe.calculator.proto.InferenceCalculatorProto
+          .InferenceCalculatorOptions.Delegate.Gpu gpu =
+          BaseOptionsUtils.convertBaseOptionsToProto(options).getAcceleration().getGpu();
+      String expected = backend == BaseOptions.DelegateOptions.GpuOptions.GpuBackend.AUTO
+          ? "ANY" : backend.name();
+      assertThat(gpu.getApi().name()).isEqualTo(expected);
+      assertThat(gpu.getUseAdvancedGpuApi()).isTrue();
+      assertThat(gpu.getModelToken()).isEqualTo(MODEL_TOKEN);
+      assertThat(gpu.getCachedKernelPath()).isEqualTo(CACHED_KERNEL_PATH);
+      assertThat(gpu.getSerializedModelDir()).isEqualTo(SERIALIZED_MODEL_DIR);
+    }
+  }
+
+  @Test
   public void succeedsWithNpuOptions() throws Exception {
     BaseOptions options =
         BaseOptions.builder()

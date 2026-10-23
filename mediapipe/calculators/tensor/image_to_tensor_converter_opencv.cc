@@ -132,30 +132,43 @@ class ImageToTensorOpenCvConverter : public ImageToTensorConverter {
 
     ABSL_RETURN_IF_ERROR(ValidateRoi(roi));
 
-    const cv::RotatedRect rotated_rect(cv::Point2f(roi.center_x, roi.center_y),
-                                       cv::Size2f(roi.width, roi.height),
-                                       roi.rotation * 180.f / M_PI);
-    cv::Mat src_points;
-    cv::boxPoints(rotated_rect, src_points);
-
-    const float dst_width = output_width;
-    const float dst_height = output_height;
-    /* clang-format off */
-    float dst_corners[8] = {0.0f,      dst_height,
-                            0.0f,      0.0f,
-                            dst_width, 0.0f,
-                            dst_width, dst_height};
-    /* clang-format on */
-
     auto src = mediapipe::formats::MatView(&input);
-    cv::Mat dst_points = cv::Mat(4, 2, CV_32F, dst_corners);
-    cv::Mat projection_matrix =
-        cv::getPerspectiveTransform(src_points, dst_points);
+    // An application-cropped pose image can already have the model's dimensions.
+    // Skip only an exact identity transform: no tolerance that could erase a
+    // subpixel crop, translation, rotation, or resize. MatView keeps input storage
+    // alive through conversion; neither this alias nor convertTo mutates it.
+    const bool identity_transform =
+        output_width == src->cols && output_height == src->rows &&
+        roi.width == src->cols && roi.height == src->rows &&
+        roi.center_x == src->cols * 0.5f &&
+        roi.center_y == src->rows * 0.5f && roi.rotation == 0.f;
     cv::Mat transformed;
-    cv::warpPerspective(*src, transformed, projection_matrix,
-                        cv::Size(dst_width, dst_height),
-                        /*flags=*/flags_,
-                        /*borderMode=*/border_mode_);
+    if (identity_transform) {
+      transformed = *src;
+    } else {
+      const cv::RotatedRect rotated_rect(cv::Point2f(roi.center_x, roi.center_y),
+                                        cv::Size2f(roi.width, roi.height),
+                                        roi.rotation * 180.f / M_PI);
+      cv::Mat src_points;
+      cv::boxPoints(rotated_rect, src_points);
+
+      const float dst_width = output_width;
+      const float dst_height = output_height;
+      /* clang-format off */
+      float dst_corners[8] = {0.0f,      dst_height,
+                              0.0f,      0.0f,
+                              dst_width, 0.0f,
+                              dst_width, dst_height};
+      /* clang-format on */
+
+      cv::Mat dst_points = cv::Mat(4, 2, CV_32F, dst_corners);
+      cv::Mat projection_matrix =
+          cv::getPerspectiveTransform(src_points, dst_points);
+      cv::warpPerspective(*src, transformed, projection_matrix,
+                          cv::Size(dst_width, dst_height),
+                          /*flags=*/flags_,
+                          /*borderMode=*/border_mode_);
+    }
 
     if (transformed.channels() > output_channels) {
       cv::Mat proper_channels_mat;

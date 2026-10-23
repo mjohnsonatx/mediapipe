@@ -23,17 +23,22 @@ absl::Status InferenceOnDiskCacheHelper::Init(
   // The kernel cache needs a unique filename based on either model_path or the
   // model token, to prevent the cache from being overwritten if the graph has
   // more than one model.
-  use_kernel_caching_ =
+  // Disk caches are OpenCL-specific. Forced OpenGL must not read them:
+  // an irrelevant cache read failure would otherwise abort GL initialization.
+  const bool supports_cache = gpu_delegate_options.api() !=
+      mediapipe::InferenceCalculatorOptions::Delegate::Gpu::OPENGL;
+  use_kernel_caching_ = supports_cache &&
       gpu_delegate_options.has_cached_kernel_path() &&
       (options.has_model_path() || gpu_delegate_options.has_model_token());
-  use_serialized_model_ = gpu_delegate_options.has_serialized_model_dir() &&
+  use_serialized_model_ = supports_cache &&
+                          gpu_delegate_options.has_serialized_model_dir() &&
                           gpu_delegate_options.has_model_token();
 
   if (use_kernel_caching_) {
     absl::string_view basename =
-        options.has_model_path()
-            ? mediapipe::file::Basename(options.model_path())
-            : gpu_delegate_options.model_token();
+        gpu_delegate_options.has_model_token()
+            ? gpu_delegate_options.model_token()
+            : mediapipe::file::Basename(options.model_path());
     cached_kernel_filename_ =
         mediapipe::file::JoinPath(gpu_delegate_options.cached_kernel_path(),
                                   absl::StrCat(basename, ".ker"));

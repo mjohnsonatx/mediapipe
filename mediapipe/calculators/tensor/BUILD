@@ -1423,6 +1423,8 @@ cc_library(
     deps = [
         ":tensors_to_detections_calculator_cc_proto",
         "//mediapipe/framework:calculator_framework",
+        "//mediapipe/framework:memory_manager",
+        "//mediapipe/framework:memory_manager_service",
         "//mediapipe/framework:port",
         "//mediapipe/framework/api2:node",
         "//mediapipe/framework/deps:file_path",
@@ -1446,6 +1448,33 @@ cc_library(
         "//conditions:default": [],
     }),
     alwayslink = 1,
+)
+
+cc_test(
+    name = "tensors_to_detections_calculator_gl_test",
+    srcs = ["tensors_to_detections_calculator_gl_test.cc"],
+    tags = ["manual", "requires-gpu"],  # Requires an OpenGL ES 3.1 context.
+    deps = [
+        ":tensors_to_detections_calculator",
+        ":tensors_to_detections_calculator_cc_proto",
+        "//mediapipe/framework:calculator_graph",
+        "//mediapipe/framework:memory_manager",
+        "//mediapipe/framework:memory_manager_service",
+        "//mediapipe/framework/formats:detection_cc_proto",
+        "//mediapipe/framework/formats:tensor",
+        "//mediapipe/framework/formats/object_detection:anchor_cc_proto",
+        "//mediapipe/framework/port:gtest",
+        "//mediapipe/framework/port:gtest_main",
+        "//mediapipe/framework/port:parse_text_proto",
+        "//mediapipe/framework/port:status_matchers",
+        "//mediapipe/gpu:gl_calculator_helper",
+        "//mediapipe/gpu:gpu_shared_data_internal",
+        "@com_google_absl//absl/log:log_entry",
+        "@com_google_absl//absl/log:log_sink",
+        "@com_google_absl//absl/log:log_sink_registry",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+    ],
 )
 
 cc_library(
@@ -1917,6 +1946,26 @@ cc_library(
         "//mediapipe/framework/port:statusor",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings",
+    ],
+)
+
+cc_test(
+    name = "image_to_tensor_converter_opencv_test",
+    srcs = ["image_to_tensor_converter_opencv_test.cc"],
+    deps = [
+        ":image_to_tensor_converter",
+        ":image_to_tensor_converter_opencv",
+        ":image_to_tensor_utils",
+        "//mediapipe/framework/formats:image",
+        "//mediapipe/framework/formats:image_format_cc_proto",
+        "//mediapipe/framework/formats:image_frame",
+        "//mediapipe/framework/formats:image_opencv",
+        "//mediapipe/framework/formats:tensor",
+        "//mediapipe/framework/port:gtest_main",
+        "//mediapipe/framework/port:opencv_core",
+        "//mediapipe/framework/port:opencv_imgproc",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
     ],
 )
 
@@ -2518,5 +2567,18 @@ cc_test(
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
+    ],
+)
+
+cc_test(
+    name = "inference_on_disk_cache_helper_test",
+    srcs = ["inference_on_disk_cache_helper_test.cc"],
+    tags = ["manual"],
+    deps = [
+        ":inference_calculator_cc_proto",
+        ":inference_on_disk_cache_helper",
+        "//mediapipe/framework/port:gtest",
+        "//mediapipe/framework/port:gtest_main",
+        "//mediapipe/framework/port:status_matchers",
     ],
 )

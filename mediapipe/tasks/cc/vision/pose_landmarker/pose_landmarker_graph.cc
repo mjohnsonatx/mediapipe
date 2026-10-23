@@ -37,6 +37,7 @@ limitations under the License.
 #include "mediapipe/tasks/cc/core/utils.h"
 #include "mediapipe/tasks/cc/metadata/utils/zip_utils.h"
 #include "mediapipe/tasks/cc/vision/pose_detector/proto/pose_detector_graph_options.pb.h"
+#include "mediapipe/tasks/cc/vision/pose_landmarker/pose_gpu_options.h"
 #include "mediapipe/tasks/cc/vision/pose_landmarker/proto/pose_landmarker_graph_options.pb.h"
 #include "mediapipe/tasks/cc/vision/pose_landmarker/proto/pose_landmarks_detector_graph_options.pb.h"
 #include "mediapipe/util/graph_builder_utils.h"
@@ -117,18 +118,8 @@ absl::Status SetSubTaskBaseOptions(const ModelAssetBundleResources& resources,
                         ->mutable_model_asset(),
                     is_copy);
   }
-  if (options->base_options().acceleration().has_gpu()) {
-    core::proto::Acceleration gpu_accel;
-    gpu_accel.mutable_gpu()->set_use_advanced_gpu_api(true);
-    pose_detector_graph_options->mutable_base_options()
-        ->mutable_acceleration()
-        ->CopyFrom(gpu_accel);
-
-  } else {
-    pose_detector_graph_options->mutable_base_options()
-        ->mutable_acceleration()
-        ->CopyFrom(options->base_options().acceleration());
-  }
+  *pose_detector_graph_options->mutable_base_options()->mutable_acceleration() =
+      PoseSubtaskAcceleration(options->base_options().acceleration(), "detector");
   pose_detector_graph_options->mutable_base_options()->set_use_stream_mode(
       options->base_options().use_stream_mode());
   auto* pose_landmarks_detector_graph_options =
@@ -143,9 +134,9 @@ absl::Status SetSubTaskBaseOptions(const ModelAssetBundleResources& resources,
             ->mutable_model_asset(),
         is_copy);
   }
-  pose_landmarks_detector_graph_options->mutable_base_options()
-      ->mutable_acceleration()
-      ->CopyFrom(options->base_options().acceleration());
+  *pose_landmarks_detector_graph_options->mutable_base_options()
+       ->mutable_acceleration() =
+      PoseSubtaskAcceleration(options->base_options().acceleration(), "landmarks");
   pose_landmarks_detector_graph_options->mutable_base_options()
       ->set_use_stream_mode(options->base_options().use_stream_mode());
 

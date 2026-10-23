@@ -208,6 +208,20 @@ public final class BaseOptionsUtils {
                   && gpuOptions.modelToken().isPresent()) {
                 cacheOptionsBuilder.setSerializeProgramCache(true);
               }
+              switch (gpuOptions.gpuBackend()) {
+                case OPENGL:
+                  gpuBuilder.setBackend(
+                      InferenceCalculatorProto.InferenceCalculatorOptions.Delegate.LiteRt.Gpu
+                          .Backend.OPENGL);
+                  break;
+                case OPENCL:
+                  gpuBuilder.setBackend(
+                      InferenceCalculatorProto.InferenceCalculatorOptions.Delegate.LiteRt.Gpu
+                          .Backend.OPENCL);
+                  break;
+                case AUTO:
+                  break;
+              }
               gpuBuilder.setCacheOptions(cacheOptionsBuilder);
               litertBuilder.setGpu(gpuBuilder.build());
             });
@@ -231,6 +245,20 @@ public final class BaseOptionsUtils {
     InferenceCalculatorProto.InferenceCalculatorOptions.Delegate.Gpu.Builder gpuBuilder =
         InferenceCalculatorProto.InferenceCalculatorOptions.Delegate.Gpu.newBuilder()
             .setUseAdvancedGpuApi(true);
+    switch (options.gpuBackend()) {
+      case OPENGL:
+        gpuBuilder.setApi(
+            InferenceCalculatorProto.InferenceCalculatorOptions.Delegate.Gpu.Api.OPENGL);
+        break;
+      case OPENCL:
+        gpuBuilder.setApi(
+            InferenceCalculatorProto.InferenceCalculatorOptions.Delegate.Gpu.Api.OPENCL);
+        break;
+      case AUTO:
+        gpuBuilder.setApi(
+            InferenceCalculatorProto.InferenceCalculatorOptions.Delegate.Gpu.Api.ANY);
+        break;
+    }
     options.cachedKernelPath().ifPresent(gpuBuilder::setCachedKernelPath);
     options.serializedModelDir().ifPresent(gpuBuilder::setSerializedModelDir);
     options.modelToken().ifPresent(gpuBuilder::setModelToken);

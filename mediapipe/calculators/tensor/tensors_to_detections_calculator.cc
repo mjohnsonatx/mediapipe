@@ -25,6 +25,8 @@
 #include "mediapipe/framework/formats/location.h"
 #include "mediapipe/framework/formats/object_detection/anchor.pb.h"
 #include "mediapipe/framework/formats/tensor.h"
+#include "mediapipe/framework/memory_manager.h"
+#include "mediapipe/framework/memory_manager_service.h"
 #include "mediapipe/framework/port.h"
 #include "mediapipe/framework/port/ret_check.h"
 
@@ -253,8 +255,11 @@ class TensorsToDetectionsCalculator : public Node {
   id<MTLComputePipelineState> score_program_;
 #endif  // !defined(MEDIAPIPE_DISABLE_GL_COMPUTE)
   std::unique_ptr<Tensor> raw_anchors_buffer_;
+#if MEDIAPIPE_METAL_ENABLED
   std::unique_ptr<Tensor> decoded_boxes_buffer_;
   std::unique_ptr<Tensor> scored_boxes_buffer_;
+#endif
+  MemoryManager* memory_manager_ = nullptr;
 
   bool gpu_inited_ = false;
   bool gpu_input_ = false;
@@ -265,6 +270,7 @@ MEDIAPIPE_REGISTER_NODE(TensorsToDetectionsCalculator);
 
 absl::Status TensorsToDetectionsCalculator::UpdateContract(
     CalculatorContract* cc) {
+  cc->UseService(kMemoryManagerService).Optional();
   if (CanUseGpu()) {
 #ifndef MEDIAPIPE_DISABLE_GL_COMPUTE
     ABSL_RETURN_IF_ERROR(mediapipe::GlCalculatorHelper::UpdateContract(
@@ -280,6 +286,9 @@ absl::Status TensorsToDetectionsCalculator::UpdateContract(
 
 absl::Status TensorsToDetectionsCalculator::Open(CalculatorContext* cc) {
   ABSL_RETURN_IF_ERROR(LoadOptions(cc));
+  if (cc->Service(kMemoryManagerService).IsAvailable()) {
+    memory_manager_ = &cc->Service(kMemoryManagerService).GetObject();
+  }
 
   if (CanUseGpu()) {
 #ifndef MEDIAPIPE_DISABLE_GL_COMPUTE
@@ -521,9 +530,18 @@ absl::Status TensorsToDetectionsCalculator::ProcessGPU(
   RET_CHECK_GE(input_tensors.size(), 2);
   RET_CHECK_GT(num_boxes_, 0) << "Please set num_boxes in calculator options";
 #ifndef MEDIAPIPE_DISABLE_GL_COMPUTE
+  // Tensor write views are single-use. Each packet gets fresh wrappers; the
+  // MemoryManager reuses backing storage only after these views and CPU reads
+  // have finished. Rewriting persistent Tensor instances invalidates their
+  // cross-context synchronization contract.
+  Tensor scored_boxes(Tensor::ElementType::kFloat32,
+                      Tensor::Shape{1, num_boxes_ * 2}, memory_manager_);
+  Tensor decoded_boxes(Tensor::ElementType::kFloat32,
+                       Tensor::Shape{1, num_boxes_ * num_coords_},
+                       memory_manager_);
 
   ABSL_RETURN_IF_ERROR(gpu_helper_.RunInGlContext([this, &input_tensors, &cc,
-                                                   &output_detections]()
+                                                   &scored_boxes, &decoded_boxes]()
                                                       -> absl::Status {
     if (!anchors_init_) {
       if (input_tensors.size() == kNumInputTensorsWithAnchors) {
@@ -549,9 +567,9 @@ absl::Status TensorsToDetectionsCalculator::ProcessGPU(
     // the reading buffers' views.
     {
       // Decode boxes.
-      auto scored_boxes_view = scored_boxes_buffer_->GetOpenGlBufferWriteView();
+      auto scored_boxes_view = scored_boxes.GetOpenGlBufferWriteView();
       auto decoded_boxes_view =
-          decoded_boxes_buffer_->GetOpenGlBufferWriteView();
+          decoded_boxes.GetOpenGlBufferWriteView();
       glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, decoded_boxes_view.name());
       auto input0_view =
           input_tensors[tensor_mapping_.detections_tensor_index()]
@@ -580,13 +598,13 @@ absl::Status TensorsToDetectionsCalculator::ProcessGPU(
   // The order of requesting of CpuViews must be the same as the order of
   // requesting OpenGlViews above to avoid 'Potential mutex deadlock' message
   // when compiled without '-c opt' option.
-  auto scored_boxes_view = scored_boxes_buffer_->GetCpuReadView();
+  auto scored_boxes_view = scored_boxes.GetCpuReadView();
   auto score_class_id_pairs = scored_boxes_view.buffer<float>();
   for (int i = 0; i < num_boxes_; ++i) {
     detection_scores[i] = score_class_id_pairs[i * 2];
     detection_classes[i] = static_cast<int>(score_class_id_pairs[i * 2 + 1]);
   }
-  auto decoded_boxes_view = decoded_boxes_buffer_->GetCpuReadView();
+  auto decoded_boxes_view = decoded_boxes.GetCpuReadView();
   auto boxes = decoded_boxes_view.buffer<float>();
   ABSL_RETURN_IF_ERROR(ConvertToDetections(boxes, detection_scores.data(),
                                            detection_classes.data(),
@@ -689,8 +707,6 @@ absl::Status TensorsToDetectionsCalculator::Close(CalculatorContext* cc) {
 #ifndef MEDIAPIPE_DISABLE_GL_COMPUTE
   if (gpu_inited_) {
     gpu_helper_.RunInGlContext([this] {
-      decoded_boxes_buffer_ = nullptr;
-      scored_boxes_buffer_ = nullptr;
       raw_anchors_buffer_ = nullptr;
       glDeleteProgram(decode_program_);
       glDeleteProgram(score_program_);
@@ -1092,10 +1108,7 @@ void main() {
     glDeleteShader(shader);
     glLinkProgram(decode_program_);
 
-    // Outputs
-    decoded_boxes_buffer_ =
-        absl::make_unique<Tensor>(Tensor::ElementType::kFloat32,
-                                  Tensor::Shape{1, num_boxes_ * num_coords_});
+    // Anchors are immutable after their first upload.
     raw_anchors_buffer_ = absl::make_unique<Tensor>(
         Tensor::ElementType::kFloat32,
         Tensor::Shape{1, num_boxes_ * kNumCoordsPerBox});
@@ -1203,10 +1216,6 @@ void main() {
       glDeleteShader(shader);
       glLinkProgram(score_program_);
     }
-
-    // Outputs
-    scored_boxes_buffer_ = absl::make_unique<Tensor>(
-        Tensor::ElementType::kFloat32, Tensor::Shape{1, num_boxes_ * 2});
 
     return absl::OkStatus();
   }));

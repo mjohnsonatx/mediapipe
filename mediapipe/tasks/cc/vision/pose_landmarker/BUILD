@@ -117,6 +117,7 @@ cc_library(
     name = "pose_landmarker_graph",
     srcs = ["pose_landmarker_graph.cc"],
     deps = [
+        ":pose_gpu_options",
         ":pose_landmarks_detector_graph",
         "//mediapipe/calculators/core:clip_vector_size_calculator",
         "//mediapipe/calculators/core:clip_vector_size_calculator_cc_proto",
@@ -232,5 +233,26 @@ cc_test(
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:str_format",
+    ],
+)
+
+cc_library(
+    name = "pose_gpu_options",
+    hdrs = ["pose_gpu_options.h"],
+    deps = [
+        "//mediapipe/tasks/cc/core/proto:acceleration_cc_proto",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+cc_test(
+    name = "pose_gpu_options_test",
+    srcs = ["pose_gpu_options_test.cc"],
+    deps = [
+        ":pose_gpu_options",
+        "//mediapipe/calculators/tensor:inference_calculator_cc_proto",
+        "//mediapipe/framework/port:gtest",
+        "//mediapipe/framework/port:gtest_main",
+        "//mediapipe/tasks/cc/core/proto:acceleration_cc_proto",
     ],
 )
