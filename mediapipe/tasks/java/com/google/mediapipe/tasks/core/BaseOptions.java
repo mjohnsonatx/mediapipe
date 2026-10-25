@@ -128,6 +128,13 @@ public abstract class BaseOptions {
     @AutoValue
     public abstract static class CpuOptions extends DelegateOptions {
 
+      /**
+       * CPU inference parallelism per model, including the invoking thread (not graph executor
+       * size). A positive explicit value selects XNNPACK and also configures non-delegated CPU
+       * kernels. Unset retains the legacy runtime default. Native helpers live until task close.
+       */
+      public abstract Optional<Integer> numThreads();
+
       public static Builder builder() {
         Builder builder = new AutoValue_BaseOptions_DelegateOptions_CpuOptions.Builder();
         return builder;
@@ -137,7 +144,17 @@ public abstract class BaseOptions {
       @AutoValue.Builder
       public abstract static class Builder {
 
-        public abstract CpuOptions build();
+        public abstract Builder setNumThreads(Integer numThreads);
+
+        abstract CpuOptions autoBuild();
+
+        public final CpuOptions build() {
+          CpuOptions options = autoBuild();
+          if (options.numThreads().isPresent() && options.numThreads().get() <= 0) {
+            throw new IllegalArgumentException("CPU numThreads must be positive when specified.");
+          }
+          return options;
+        }
       }
     }
 

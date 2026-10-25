@@ -15,6 +15,7 @@
 package com.google.mediapipe.tasks.core;
 
 import static com.google.common.truth.Truth.assertThat;
+import static org.junit.Assert.assertThrows;
 
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 import com.google.mediapipe.tasks.core.proto.AccelerationProto;
@@ -32,6 +33,33 @@ public class BaseOptionsUtilsTest {
   static final String CACHED_KERNEL_PATH = "dummy_cached_kernel_path";
   static final String DISPATCH_LIBRARY_PATH = "dummy_dispatch_library_path";
   static final String COMPILER_PLUGIN_LIBRARY_PATH = "dummy_compiler_plugin_library_path";
+
+  @Test
+  public void explicitCpuThreadsSelectXnnpackAndSurviveSerialization() {
+    for (int threads : new int[] {1, 2, 4}) {
+      BaseOptions options = BaseOptions.builder()
+          .setModelAssetPath(MODEL_ASSET_PATH)
+          .setDelegate(Delegate.CPU)
+          .setDelegateOptions(BaseOptions.DelegateOptions.CpuOptions.builder()
+              .setNumThreads(threads).build())
+          .build();
+      AccelerationProto.Acceleration acceleration =
+          BaseOptionsUtils.convertBaseOptionsToProto(options).getAcceleration();
+      assertThat(acceleration.hasXnnpack()).isTrue();
+      assertThat(acceleration.hasTflite()).isFalse();
+      assertThat(acceleration.getXnnpack().getNumThreads()).isEqualTo(threads);
+    }
+  }
+
+  @Test
+  public void explicitCpuThreadsMustBePositive() {
+    for (int threads : new int[] {0, -1, Integer.MIN_VALUE}) {
+      assertThrows(IllegalArgumentException.class,
+          () -> BaseOptions.DelegateOptions.CpuOptions.builder().setNumThreads(threads).build());
+    }
+    assertThat(BaseOptions.DelegateOptions.CpuOptions.builder().build().numThreads().isPresent())
+        .isFalse();
+  }
 
   @Test
   public void succeedsWithDefaultOptions() throws Exception {

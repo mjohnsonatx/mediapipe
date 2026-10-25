@@ -112,9 +112,15 @@ class InferenceSubgraph : public Subgraph {
         graph.SideOut(kMetadataExtractorTag);
 
     auto& inference_node = graph.AddNode("InferenceCalculator");
-    inference_node.GetOptions<mediapipe::InferenceCalculatorOptions>()
-        .mutable_delegate()
-        ->CopyFrom(inference_delegate);
+    auto& inference_options =
+        inference_node.GetOptions<mediapipe::InferenceCalculatorOptions>();
+    inference_options.mutable_delegate()->CopyFrom(inference_delegate);
+    if (inference_delegate.has_xnnpack() &&
+        inference_delegate.xnnpack().num_threads() > 0) {
+      // XNNPACK owns its own pool; the interpreter setting separately controls CPU kernels
+      // outside delegated partitions. Neither setting changes the graph executor's size.
+      inference_options.set_cpu_num_thread(inference_delegate.xnnpack().num_threads());
+    }
     model_resources_node.SideOut(kModelTag) >> inference_node.SideIn(kModelTag);
     model_resources_node.SideOut(kOpResolverTag) >>
         inference_node.SideIn(kOpResolverTag);

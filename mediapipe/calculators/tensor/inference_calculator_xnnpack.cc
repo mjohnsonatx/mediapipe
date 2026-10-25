@@ -17,6 +17,7 @@
 #include <utility>
 #include <vector>
 
+#include "absl/log/absl_log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/time/time.h"
@@ -30,9 +31,33 @@
 #include "mediapipe/framework/port/ret_check.h"
 #include "mediapipe/framework/port/status_macros.h"
 #include "tflite/delegates/xnnpack/xnnpack_delegate.h"
+#include "pthreadpool.h"
 
 namespace mediapipe {
 namespace api2 {
+
+namespace {
+
+// Preserve every task/custom op registration, but suppress resolver-provided lazy delegates.
+// Otherwise a partially delegated model may allocate a second implicit XNNPACK pool after the
+// explicitly configured pool has been verified. The retained packet owns the source resolver.
+class ExplicitCpuOpResolver final : public tflite::OpResolver {
+ public:
+  explicit ExplicitCpuOpResolver(Packet<tflite::OpResolver> source)
+      : source_(std::move(source)) {}
+
+  const TfLiteRegistration* FindOp(tflite::BuiltinOperator op, int version) const override {
+    return source_.Get().FindOp(op, version);
+  }
+  const TfLiteRegistration* FindOp(const char* op, int version) const override {
+    return source_.Get().FindOp(op, version);
+  }
+
+ private:
+  Packet<tflite::OpResolver> source_;
+};
+
+}  // namespace
 
 class InferenceCalculatorXnnpackImpl
     : public InferenceCalculatorNodeImpl<InferenceCalculatorXnnpack,
@@ -86,12 +111,14 @@ absl::StatusOr<std::unique_ptr<InferenceRunner>>
 InferenceCalculatorXnnpackImpl::CreateInferenceRunner(CalculatorContext* cc) {
   ABSL_ASSIGN_OR_RETURN(auto model_packet, GetModelAsPacket(cc));
   ABSL_ASSIGN_OR_RETURN(auto op_resolver_packet, GetOpResolverAsPacket(cc));
+  auto explicit_resolver = PacketAdopting<tflite::OpResolver>(
+      std::make_unique<ExplicitCpuOpResolver>(std::move(op_resolver_packet)));
   const auto& calculator_opts =
       cc->Options<mediapipe::InferenceCalculatorOptions>();
   const int interpreter_num_threads = calculator_opts.cpu_num_thread();
   ABSL_ASSIGN_OR_RETURN(TfLiteDelegatePtr delegate, CreateDelegate(cc));
   return CreateInferenceInterpreterDelegateRunner(
-      std::move(model_packet), std::move(op_resolver_packet),
+      std::move(model_packet), std::move(explicit_resolver),
       std::move(delegate), interpreter_num_threads,
       &calculator_opts.input_output_config(),
       calculator_opts.delegate().xnnpack().enable_zero_copy_tensor_io());
@@ -119,8 +146,26 @@ InferenceCalculatorXnnpackImpl::CreateDelegate(CalculatorContext* cc) {
   auto xnnpack_opts = TfLiteXNNPackDelegateOptionsDefault();
   xnnpack_opts.num_threads =
       GetXnnpackNumThreads(opts_has_delegate, opts_delegate);
-  return TfLiteDelegatePtr(TfLiteXNNPackDelegateCreate(&xnnpack_opts),
-                           &TfLiteXNNPackDelegateDelete);
+  TfLiteDelegatePtr delegate(TfLiteXNNPackDelegateCreate(&xnnpack_opts),
+                             &TfLiteXNNPackDelegateDelete);
+  RET_CHECK(delegate != nullptr) << "CPU XNNPACK delegate creation failed: node="
+                                << cc->NodeName();
+  const auto pool = static_cast<pthreadpool_t>(
+      TfLiteXNNPackDelegateGetThreadPool(delegate.get()));
+  const size_t effective_threads = pool == nullptr ? 1 : pthreadpool_get_threads_count(pool);
+  // Initialization only. This is measured native pool capacity, not a claim that every op uses
+  // every worker. The invoking thread participates; Close destroys the runner/delegate and joins
+  // its persistent helpers. Graph executors and other model instances have independent pools.
+  ABSL_LOG(INFO) << "MediaPipeCpuThreads node=" << cc->NodeName()
+                 << " requested=" << xnnpack_opts.num_threads
+                 << " effective=" << effective_threads
+                 << " helpers=" << (effective_threads - 1)
+                 << " interpreter=" << calculator_opts.cpu_num_thread();
+  if (opts_delegate.has_xnnpack() && opts_delegate.xnnpack().num_threads() > 0) {
+    RET_CHECK_EQ(effective_threads, static_cast<size_t>(xnnpack_opts.num_threads))
+        << "Explicit CPU thread count could not be honored: node=" << cc->NodeName();
+  }
+  return delegate;
 }
 
 }  // namespace api2

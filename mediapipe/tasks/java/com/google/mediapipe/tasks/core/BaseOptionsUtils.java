@@ -159,8 +159,14 @@ public final class BaseOptionsUtils {
   private static void setDelegateOptions(
       AccelerationProto.Acceleration.Builder accelerationBuilder,
       BaseOptions.DelegateOptions.CpuOptions options) {
-    accelerationBuilder.setTflite(
-        InferenceCalculatorProto.InferenceCalculatorOptions.Delegate.TfLite.getDefaultInstance());
+    if (options.numThreads().isPresent()) {
+      accelerationBuilder.setXnnpack(
+          InferenceCalculatorProto.InferenceCalculatorOptions.Delegate.Xnnpack.newBuilder()
+              .setNumThreads(options.numThreads().get()));
+    } else {
+      accelerationBuilder.setTflite(
+          InferenceCalculatorProto.InferenceCalculatorOptions.Delegate.TfLite.getDefaultInstance());
+    }
   }
 
   private static void setDelegateOptions(
@@ -188,6 +194,7 @@ public final class BaseOptionsUtils {
                   cpuBuilder =
                       InferenceCalculatorProto.InferenceCalculatorOptions.Delegate.LiteRt.Cpu
                           .newBuilder();
+              cpuOptions.numThreads().ifPresent(cpuBuilder::setNumThreads);
               litertBuilder.setCpu(cpuBuilder.build());
             });
     options
