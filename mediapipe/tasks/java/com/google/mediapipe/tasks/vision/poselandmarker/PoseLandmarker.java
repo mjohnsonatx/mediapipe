@@ -28,7 +28,9 @@ import com.google.mediapipe.framework.PacketGetter;
 import com.google.mediapipe.framework.TextureFrame;
 import com.google.mediapipe.framework.image.BitmapImageBuilder;
 import com.google.mediapipe.framework.image.ByteBufferImageBuilder;
+import com.google.mediapipe.framework.image.ByteBufferExtractor;
 import com.google.mediapipe.framework.image.MPImage;
+import com.google.mediapipe.framework.image.MPImageProperties;
 import com.google.mediapipe.tasks.components.containers.Connection;
 import com.google.mediapipe.tasks.components.containers.NormalizedRect;
 import com.google.mediapipe.tasks.core.BaseOptions;
@@ -293,7 +295,8 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
                 .build(),
             handler,
             parentGlContext);
-    return new PoseLandmarker(runner, landmarkerOptions.runningMode());
+    return new PoseLandmarker(runner, landmarkerOptions.runningMode(),
+        landmarkerOptions.borrowedImageInput().orElse(false));
   }
 
   @SuppressWarnings("ConstantCaseForConstants")
@@ -306,8 +309,14 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
    * @param taskRunner a {@link TaskRunner}.
    * @param runningMode a mediapipe vision task {@link RunningMode}.
    */
-  private PoseLandmarker(TaskRunner taskRunner, RunningMode runningMode) {
+  private final boolean borrowedImageInput;
+  private final java.util.concurrent.atomic.AtomicInteger borrowedImages =
+      new java.util.concurrent.atomic.AtomicInteger();
+  private final Runnable borrowedImageReleased = () -> borrowedImages.set(0);
+
+  private PoseLandmarker(TaskRunner taskRunner, RunningMode runningMode, boolean borrowedImageInput) {
     super(taskRunner, runningMode, IMAGE_IN_STREAM_NAME, NORM_RECT_IN_STREAM_NAME);
+    this.borrowedImageInput = borrowedImageInput;
   }
 
   /**
@@ -597,8 +606,31 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
       int sourceImageHeight,
       long timestampMs) {
     RectProto.NormalizedRect imageRect = convertToNormalizedRect(imageProcessingOptions, image);
-    Packet imagePacket = runner.getPacketCreator().createImage(image);
-    return processVideoPackets(
+    // Bitmap inputs (offline/benchmark callers) retain their existing copying contract.
+    MPImageProperties properties = borrowedImageInput ? image.getContainedImageProperties().get(0) : null;
+    boolean borrow = borrowedImageInput
+        && properties.getStorageType() == MPImage.STORAGE_TYPE_BYTEBUFFER;
+    if (borrow && properties.getImageFormat() != MPImage.IMAGE_FORMAT_RGBA) {
+      throw new IllegalArgumentException("Borrowed video input requires RGBA ByteBuffer MPImage.");
+    }
+    Packet imagePacket;
+    if (borrow) {
+      if (!borrowedImages.compareAndSet(0, 1)) {
+        throw new IllegalStateException("A previous borrowed pose input is still owned by native code.");
+      }
+      try {
+        imagePacket = runner.getPacketCreator().createBorrowedRgbaImage(
+            ByteBufferExtractor.extract(image), image.getWidth(), image.getHeight(), borrowedImageReleased);
+      } catch (RuntimeException | Error failure) {
+        borrowedImages.set(0);
+        throw failure;
+      }
+    } else {
+      imagePacket = runner.getPacketCreator().createImage(image);
+    }
+    Throwable primaryFailure = null;
+    try {
+      return processVideoPackets(
         imagePacket,
         imageRect,
         externalPoseRect,
@@ -606,6 +638,28 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
         sourceImageWidth,
         sourceImageHeight,
         timestampMs);
+    } catch (RuntimeException | Error failure) {
+      primaryFailure = failure;
+      throw failure;
+    } finally {
+      // Never return a mutable app buffer while native packets still retain it. The graph
+      // normally releases the image before its idle barrier. On errors/retention, drain and
+      // close this graph before the app's existing stage recovery can recycle the lease.
+      if (borrow && borrowedImages.get() != 0) {
+        IllegalStateException retained = new IllegalStateException(
+            "Borrowed pose input retained after graph idle; closing graph before lease recovery.");
+        try {
+          runner.close();
+        } catch (RuntimeException | Error cleanupFailure) {
+          retained.addSuppressed(cleanupFailure);
+        }
+        if (primaryFailure != null) {
+          primaryFailure.addSuppressed(retained);
+        } else {
+          throw retained;
+        }
+      }
+    }
   }
 
   private PoseLandmarkerResult processVideoTextureData(
@@ -823,6 +877,8 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
        * <p>Set to false when the caller owns temporal filtering across landmarker instances.
        */
       public abstract Builder setSmoothLandmarks(Boolean value);
+      /** VIDEO-only opt-in for direct RGBA inputs; bitmap inputs keep the copying path. */
+      public abstract Builder setBorrowedImageInput(Boolean value);
 
       public abstract Builder setOutputSegmentationMasks(boolean value);
 
@@ -847,6 +903,9 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
        */
       public final PoseLandmarkerOptions build() {
         PoseLandmarkerOptions options = autoBuild();
+        if (options.borrowedImageInput().orElse(false) && options.runningMode() != RunningMode.VIDEO) {
+          throw new IllegalArgumentException("Borrowed image input requires synchronous VIDEO mode.");
+        }
         if (options.runningMode() == RunningMode.LIVE_STREAM) {
           if (!options.resultListener().isPresent()) {
             throw new IllegalArgumentException(
@@ -862,7 +921,9 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
       }
     }
 
-    abstract BaseOptions baseOptions();
+    public abstract BaseOptions baseOptions();
+
+    public abstract Builder toBuilder();
 
     abstract RunningMode runningMode();
 
@@ -875,6 +936,12 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
     abstract Optional<Float> minTrackingConfidence();
 
     abstract Optional<Boolean> smoothLandmarks();
+    abstract Optional<Boolean> borrowedImageInput();
+
+    @Override
+    public void configureGraph(com.google.mediapipe.proto.CalculatorProto.CalculatorGraphConfig.Builder graph) {
+      configureCpuGraph(graph, baseOptions());
+    }
 
     abstract boolean outputSegmentationMasks();
 

@@ -16,6 +16,11 @@
 #include <string>
 #include <utility>
 #include <vector>
+#if defined(__ANDROID__) || defined(__linux__)
+#include <sched.h>
+#include <sys/resource.h>
+#include <unistd.h>
+#endif
 
 #include "absl/log/absl_log.h"
 #include "absl/status/status.h"
@@ -160,7 +165,27 @@ InferenceCalculatorXnnpackImpl::CreateDelegate(CalculatorContext* cc) {
                  << " requested=" << xnnpack_opts.num_threads
                  << " effective=" << effective_threads
                  << " helpers=" << (effective_threads - 1)
-                 << " interpreter=" << calculator_opts.cpu_num_thread();
+                 << " interpreter=" << calculator_opts.cpu_num_thread()
+                 << " zeroCopy=" << opts_delegate.xnnpack().enable_zero_copy_tensor_io();
+#if defined(__ANDROID__) || defined(__linux__)
+  cpu_set_t allowed;
+  CPU_ZERO(&allowed);
+  std::string cores;
+  if (sched_getaffinity(0, sizeof(allowed), &allowed) == 0) {
+    for (int core = 0; core < CPU_SETSIZE; ++core) {
+      if (CPU_ISSET(core, &allowed)) {
+        if (!cores.empty()) cores += ',';
+        cores += std::to_string(core);
+      }
+    }
+  } else {
+    cores = "unavailable";
+  }
+  ABSL_LOG(INFO) << "MediaPipeCpuThreads node=" << cc->NodeName()
+                 << " creatorTid=" << gettid()
+                 << " nice=" << getpriority(PRIO_PROCESS, 0)
+                 << " allowedCores=" << cores;
+#endif
   if (opts_delegate.has_xnnpack() && opts_delegate.xnnpack().num_threads() > 0) {
     RET_CHECK_EQ(effective_threads, static_cast<size_t>(xnnpack_opts.num_threads))
         << "Explicit CPU thread count could not be honored: node=" << cc->NodeName();

@@ -105,6 +105,10 @@ JNIEXPORT jlong JNICALL PACKET_CREATOR_METHOD(nativeCreateCpuImage)(
     JNIEnv* env, jobject thiz, jlong context, jobject byte_buffer, jint width,
     jint height, jint width_step, jint num_channels);
 
+JNIEXPORT jlong JNICALL PACKET_CREATOR_METHOD(nativeCreateBorrowedRgbaImage)(
+    JNIEnv* env, jobject thiz, jlong context, jobject byte_buffer, jint width,
+    jint height, jobject on_release);
+
 JNIEXPORT jlong JNICALL PACKET_CREATOR_METHOD(nativeCreateGpuImage)(
     JNIEnv* env, jobject thiz, jlong context, jint name, jint width,
     jint height, jint format, jobject texture_release_callback);

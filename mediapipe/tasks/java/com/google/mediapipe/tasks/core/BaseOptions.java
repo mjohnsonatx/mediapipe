@@ -117,9 +117,11 @@ public abstract class BaseOptions {
 
   abstract Optional<ByteBuffer> modelAssetBuffer();
 
-  abstract Delegate delegate();
+  public abstract Delegate delegate();
 
-  abstract Optional<DelegateOptions> delegateOptions();
+  public abstract Optional<DelegateOptions> delegateOptions();
+
+  public abstract Builder toBuilder();
 
   /** Advanced config options for the used delegate. */
   public abstract static class DelegateOptions {
@@ -127,6 +129,7 @@ public abstract class BaseOptions {
     /** Options for CPU. */
     @AutoValue
     public abstract static class CpuOptions extends DelegateOptions {
+      public abstract Builder toBuilder();
 
       /**
        * CPU inference parallelism per model, including the invoking thread (not graph executor
@@ -134,6 +137,10 @@ public abstract class BaseOptions {
        * kernels. Unset retains the legacy runtime default. Native helpers live until task close.
        */
       public abstract Optional<Integer> numThreads();
+      /** Native graph executor size; independent of each model's XNNPACK parallelism. */
+      public abstract Optional<Integer> graphNumThreads();
+      /** Opt-in static, aligned input/output tensor borrowing by the CPU runner. */
+      public abstract Optional<Boolean> enableZeroCopyTensorIo();
 
       public static Builder builder() {
         Builder builder = new AutoValue_BaseOptions_DelegateOptions_CpuOptions.Builder();
@@ -145,6 +152,8 @@ public abstract class BaseOptions {
       public abstract static class Builder {
 
         public abstract Builder setNumThreads(Integer numThreads);
+        public abstract Builder setGraphNumThreads(Integer graphNumThreads);
+        public abstract Builder setEnableZeroCopyTensorIo(Boolean enabled);
 
         abstract CpuOptions autoBuild();
 
@@ -152,6 +161,9 @@ public abstract class BaseOptions {
           CpuOptions options = autoBuild();
           if (options.numThreads().isPresent() && options.numThreads().get() <= 0) {
             throw new IllegalArgumentException("CPU numThreads must be positive when specified.");
+          }
+          if (options.graphNumThreads().isPresent() && options.graphNumThreads().get() <= 0) {
+            throw new IllegalArgumentException("CPU graphNumThreads must be positive.");
           }
           return options;
         }

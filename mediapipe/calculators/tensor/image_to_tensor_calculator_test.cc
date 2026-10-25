@@ -48,6 +48,7 @@
 #include "mediapipe/framework/port/ret_check.h"
 #include "mediapipe/framework/port/status_matchers.h"
 #include "mediapipe/util/image_test_utils.h"
+#include "tflite/util.h"
 
 #if !MEDIAPIPE_DISABLE_GPU && !MEDIAPIPE_METAL_ENABLED
 #include "mediapipe/gpu/gl_context.h"
@@ -536,6 +537,14 @@ TEST(ImageToTensorCalculatorTest, CanBeUsedWithoutGpuServiceSet) {
   CalculatorGraph graph;
   MP_ASSERT_OK(graph.Initialize(graph_config));
   MP_ASSERT_OK(graph.DisallowServiceDefaultInitialization());
+  bool observed_aligned_tensor = false;
+  MP_ASSERT_OK(graph.ObserveOutputStream("tensor", [&](const mediapipe::Packet& packet) {
+    const auto& tensor = packet.Get<std::vector<Tensor>>().at(0);
+    const auto view = tensor.GetCpuReadView();
+    observed_aligned_tensor = reinterpret_cast<uintptr_t>(view.buffer<const void>()) %
+        tflite::kDefaultTensorAlignment == 0;
+    return absl::OkStatus();
+  }));
   MP_ASSERT_OK(graph.StartRun({}));
   auto image_frame =
       std::make_shared<ImageFrame>(ImageFormat::SRGBA, 128, 256, 4);
@@ -546,6 +555,7 @@ TEST(ImageToTensorCalculatorTest, CanBeUsedWithoutGpuServiceSet) {
   MP_ASSERT_OK(graph.WaitUntilIdle());
   MP_ASSERT_OK(graph.CloseAllPacketSources());
   MP_ASSERT_OK(graph.WaitUntilDone());
+  EXPECT_TRUE(observed_aligned_tensor);
 }
 
 #if !MEDIAPIPE_DISABLE_GPU && !MEDIAPIPE_METAL_ENABLED

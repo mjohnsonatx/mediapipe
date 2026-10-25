@@ -43,6 +43,7 @@
 #include "mediapipe/gpu/gpu_origin.pb.h"
 #include "mediapipe/gpu/gpu_origin_utils.h"
 #include "mediapipe/gpu/webgpu/webgpu_check.h"
+#include "tflite/util.h"
 
 #if !MEDIAPIPE_DISABLE_OPENCV
 #include "mediapipe/calculators/tensor/image_to_tensor_converter_opencv.h"
@@ -191,7 +192,11 @@ class ImageToTensorNodeImpl
     Tensor tensor(
         output_tensor_type,
         {1, tensor_height, tensor_width, GetNumOutputChannels(*image)},
-        memory_manager_);
+        memory_manager_,
+        // CPU preprocessing is the producer for zero-copy interpreter inputs. malloc's
+        // incidental alignment is insufficient; guarantee the consumer's contract here.
+        // GPU storage keeps its existing allocation policy.
+        image->UsesGpu() ? 0 : tflite::kDefaultTensorAlignment);
     ABSL_RETURN_IF_ERROR((image->UsesGpu() ? gpu_converter_ : cpu_converter_)
                              ->Convert(*image, roi, params_.range_min,
                                        params_.range_max,

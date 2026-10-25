@@ -151,6 +151,52 @@ class InferenceCalculatorDelegateRunnnerTest : public ::testing::Test {
 };
 
 TEST_F(InferenceCalculatorDelegateRunnnerTest,
+       ZeroCopyDistinctBuffersSurviveReuseAndRejectedInput) {
+  auto resources = CreateDefaultResources();
+  MP_ASSERT_OK_AND_ASSIGN(auto model, TfLiteModelLoader::LoadFromPath(*resources, kFloat32ModelFile));
+  auto resolver = PacketAdopting<tflite::OpResolver>(
+      std::make_unique<tflite::ops::builtin::BuiltinOpResolverWithoutDefaultDelegates>());
+  auto options = TfLiteXNNPackDelegateOptionsDefault();
+  options.num_threads = 2;
+  TfLiteDelegatePtr delegate(TfLiteXNNPackDelegateCreate(&options), &TfLiteXNNPackDelegateDelete);
+  MP_ASSERT_OK(ExecuteAnyInvocableInGraphCalculator([&](CalculatorContext* cc) -> absl::Status {
+    ABSL_ASSIGN_OR_RETURN(auto runner, CreateInferenceInterpreterDelegateRunner(
+        std::move(model), std::move(resolver), std::move(delegate), 2, nullptr, true));
+    std::vector<Tensor> previous;
+    for (int frame = 1; frame <= 20; ++frame) {
+      {
+        std::vector<Tensor> invalid;
+        invalid.emplace_back(Tensor::ElementType::kFloat32, Tensor::Shape{1, 2}, nullptr,
+                             tflite::kDefaultTensorAlignment);
+        EXPECT_FALSE(runner->Run(cc, MakeTensorSpan(invalid)).ok());
+      }
+      std::vector<Tensor> inputs;
+      inputs.emplace_back(Tensor::ElementType::kFloat32, Tensor::Shape{1, 3}, nullptr,
+                          tflite::kDefaultTensorAlignment);
+      {
+        auto view = inputs[0].GetCpuWriteView();
+        for (int i = 0; i < 3; ++i) view.buffer<float>()[i] = frame + i;
+      }
+      ABSL_ASSIGN_OR_RETURN(auto outputs, runner->Run(cc, MakeTensorSpan(inputs)));
+      inputs.clear();  // Borrowed interpreter pointers must already be detached.
+      auto view = outputs[0].GetCpuReadView();
+      for (int i = 0; i < 3; ++i) EXPECT_EQ(view.buffer<float>()[i], (frame + i) * (frame + i));
+      if (!previous.empty()) {
+        auto prior = previous[0].GetCpuReadView();
+        for (int i = 0; i < 3; ++i) {
+          EXPECT_EQ(prior.buffer<float>()[i], (frame - 1 + i) * (frame - 1 + i));
+        }
+      }
+      previous = std::move(outputs);
+    }
+    runner.reset();  // Outstanding output packets must remain valid beyond runner teardown.
+    auto last = previous[0].GetCpuReadView();
+    EXPECT_EQ(last.buffer<float>()[0], 400.f);
+    return absl::OkStatus();
+  }));
+}
+
+TEST_F(InferenceCalculatorDelegateRunnnerTest,
        RunInt32ModelWithXNNPackDelegate) {
   std::unique_ptr<Resources> resources = CreateDefaultResources();
   MP_ASSERT_OK_AND_ASSIGN(

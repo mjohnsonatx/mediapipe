@@ -118,26 +118,45 @@ public class TaskRunner implements AutoCloseable {
             context, taskInfo.taskName(), taskInfo.taskRunningModeName());
     AndroidAssetUtil.initializeNativeAssetManager(context);
     Graph mediapipeGraph = new Graph();
-    if (parentGlContext != 0L) {
-      mediapipeGraph.setParentGlContext(parentGlContext);
+    ModelResourcesCache graphModelResourcesCache = null;
+    try {
+      if (parentGlContext != 0L) {
+        mediapipeGraph.setParentGlContext(parentGlContext);
+      }
+      mediapipeGraph.loadBinaryGraph(taskInfo.generateGraphConfig());
+      if (extraSidePackets != null && !extraSidePackets.isEmpty()) {
+        mediapipeGraph.setInputSidePackets(extraSidePackets);
+      }
+      graphModelResourcesCache = new ModelResourcesCache();
+      mediapipeGraph.setServiceObject(new ModelResourcesCacheService(), graphModelResourcesCache);
+      mediapipeGraph.addMultiStreamCallback(
+          taskInfo.outputStreamNames(),
+          packets -> {
+            outputHandler.run(packets);
+            statsLogger.recordInvocationEnd(packets.get(0).getTimestamp());
+          },
+          /* observeTimestampBounds= */ outputHandler.handleTimestampBoundChanges());
+      mediapipeGraph.startRunningGraph();
+      // Waits until all calculators are opened and the graph is fully started.
+      mediapipeGraph.waitUntilGraphIdle();
+      return new TaskRunner(mediapipeGraph, graphModelResourcesCache, outputHandler, statsLogger);
+    } catch (RuntimeException | Error failure) {
+      // A retry must not leave a partially opened graph/XNNPACK pool behind. Native graph
+      // destruction cancels and joins work before releasing borrowed packets and services.
+      try {
+        mediapipeGraph.tearDown();
+      } catch (RuntimeException | Error cleanup) {
+        failure.addSuppressed(cleanup);
+      }
+      if (graphModelResourcesCache != null) {
+        try {
+          graphModelResourcesCache.release();
+        } catch (RuntimeException | Error cleanup) {
+          failure.addSuppressed(cleanup);
+        }
+      }
+      throw failure;
     }
-    mediapipeGraph.loadBinaryGraph(taskInfo.generateGraphConfig());
-    if (extraSidePackets != null && !extraSidePackets.isEmpty()) {
-      mediapipeGraph.setInputSidePackets(extraSidePackets);
-    }
-    ModelResourcesCache graphModelResourcesCache = new ModelResourcesCache();
-    mediapipeGraph.setServiceObject(new ModelResourcesCacheService(), graphModelResourcesCache);
-    mediapipeGraph.addMultiStreamCallback(
-        taskInfo.outputStreamNames(),
-        packets -> {
-          outputHandler.run(packets);
-          statsLogger.recordInvocationEnd(packets.get(0).getTimestamp());
-        },
-        /* observeTimestampBounds= */ outputHandler.handleTimestampBoundChanges());
-    mediapipeGraph.startRunningGraph();
-    // Waits until all calculators are opened and the graph is fully started.
-    mediapipeGraph.waitUntilGraphIdle();
-    return new TaskRunner(mediapipeGraph, graphModelResourcesCache, outputHandler, statsLogger);
   }
 
   /**
@@ -262,27 +281,37 @@ public class TaskRunner implements AutoCloseable {
   /** Closes and cleans up the {@link TaskRunner} instance. */
   @Override
   public void close() {
-    if (!graphStarted.get()) {
+    if (!graphStarted.getAndSet(false)) {
       return;
     }
+    Throwable failure = null;
     try {
-      graphStarted.set(false);
       graph.closeAllPacketSources();
       graph.waitUntilGraphDone();
       statsLogger.logSessionEnd();
-      if (modelResourcesCache != null) {
-        modelResourcesCache.release();
-      }
-    } catch (MediaPipeException e) {
-      // Note: errors during Process are reported at the earliest opportunity,
-      // which may be addPacket or waitUntilDone, depending on timing. For consistency,
-      // we want to always report them using the same async handler if installed.
-      reportError(e);
+    } catch (RuntimeException | Error e) {
+      failure = e;
     }
     try {
+      // Teardown must happen even when waitUntilGraphDone reports a processing error.
+      // Otherwise borrowed images and persistent native workers survive close().
       graph.tearDown();
-    } catch (MediaPipeException e) {
-      reportError(e);
+    } catch (RuntimeException | Error e) {
+      if (failure == null) failure = e;
+      else failure.addSuppressed(e);
+    }
+    if (modelResourcesCache != null) {
+      try {
+        modelResourcesCache.release();
+      } catch (RuntimeException | Error e) {
+        if (failure == null) failure = e;
+        else failure.addSuppressed(e);
+      }
+    }
+    if (failure != null) {
+      if (failure instanceof MediaPipeException) reportError((MediaPipeException) failure);
+      else if (failure instanceof Error) throw (Error) failure;
+      else throw (RuntimeException) failure;
     }
   }
 

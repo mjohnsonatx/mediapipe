@@ -15,12 +15,15 @@
 #include "mediapipe/calculators/tensor/inference_interpreter_delegate_runner.h"
 
 #include <cstdint>
+#include <cstdlib>
+#include <algorithm>
 #include <cstring>
 #include <memory>
 #include <utility>
 #include <vector>
 
 #include "absl/container/flat_hash_set.h"
+#include "absl/cleanup/cleanup.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "mediapipe/calculators/tensor/inference_calculator_utils.h"
@@ -132,9 +135,48 @@ class InferenceInterpreterDelegateRunner : public InferenceRunner {
     return input_output_tensor_names_;
   }
 
+  absl::Status InitializeZeroCopyStorage() {
+    if (!enable_zero_copy_tensor_io_) return absl::OkStatus();
+    RET_CHECK(!feedback_manager_ || feedback_manager_->GetNumberOfFeedbackTensors() == 0)
+        << "Zero-copy tensor I/O does not support feedback bindings.";
+    io_indices_ = interpreter_->inputs();
+    io_indices_.insert(io_indices_.end(), interpreter_->outputs().begin(), interpreter_->outputs().end());
+    for (int index : io_indices_) {
+      const TfLiteTensor* tensor = interpreter_->tensor(index);
+      RET_CHECK(tensor && tensor->allocation_type != kTfLiteDynamic && tensor->bytes > 0)
+          << "Zero-copy tensor I/O requires nonempty static tensors.";
+      if (tensor->dims_signature) {
+        for (int i = 0; i < tensor->dims_signature->size; ++i) {
+          RET_CHECK(tensor->dims_signature->data[i] >= 0)
+              << "Zero-copy tensor I/O does not support dynamic dimension signatures.";
+        }
+      }
+      idle_bytes_ = std::max(idle_bytes_, tensor->bytes);
+    }
+    void* storage = nullptr;
+    RET_CHECK_EQ(posix_memalign(&storage, tflite::kDefaultTensorAlignment, idle_bytes_), 0)
+        << "Could not allocate owned idle tensor storage.";
+    idle_storage_.reset(storage);
+    return RestoreIdleBindings();
+  }
+
  private:
+  absl::Status RestoreIdleBindings() {
+    // Shared idle storage is never invoked. Each Run binds all I/O to distinct live views
+    // before AllocateTensors/Invoke; between calls no borrowed tensor address is retained.
+    for (int index : io_indices_) {
+      ABSL_RETURN_IF_ERROR(SetTfLiteCustomAllocation(
+          *interpreter_, idle_storage_.get(), idle_bytes_, index));
+    }
+    return absl::OkStatus();
+  }
+
   api2::Packet<TfLiteModelPtr> model_;
   TfLiteDelegatePtr delegate_;
+  // Interpreter destruction must precede freeing its registered custom allocations.
+  std::unique_ptr<void, decltype(&std::free)> idle_storage_{nullptr, &std::free};
+  size_t idle_bytes_ = 0;
+  std::vector<int> io_indices_;
   std::unique_ptr<Interpreter> interpreter_;
   InputOutputTensorNames input_output_tensor_names_;
   std::unique_ptr<InferenceFeedbackManager> feedback_manager_;
@@ -143,6 +185,7 @@ class InferenceInterpreterDelegateRunner : public InferenceRunner {
 
 absl::StatusOr<std::vector<Tensor>> InferenceInterpreterDelegateRunner::Run(
     CalculatorContext* cc, const TensorSpan& tensor_span) {
+  RET_CHECK(interpreter_) << "Runner was closed after custom allocation cleanup failed.";
   const int num_feedback_tensors =
       feedback_manager_ ? feedback_manager_->GetNumberOfFeedbackTensors() : 0;
 
@@ -175,6 +218,17 @@ absl::StatusOr<std::vector<Tensor>> InferenceInterpreterDelegateRunner::Run(
   // inference call to provide Tensor read access to the interpreter.
   std::vector<Tensor::CpuReadView> input_tensor_views;
   input_tensor_views.reserve(tensor_span.size());
+  std::vector<Tensor> output_tensors;
+  std::vector<Tensor::CpuWriteView> output_tensor_views;
+  output_tensor_views.reserve(output_indices_excluding_feedback_tensors.size());
+  // Declared after every owning view/container, so cleanup runs before their destructors on
+  // success AND early return. A poisoned interpreter is destroyed while the views still live.
+  auto detach_borrowed_tensors = absl::MakeCleanup([&] {
+    if (enable_zero_copy_tensor_io_ && interpreter_) {
+      const auto status = RestoreIdleBindings();
+      if (!status.ok()) interpreter_.reset();
+    }
+  });
 
   // If the input tensors have dynamic shape, then the tensors need to be
   // resized and reallocated before we can copy the tensor values.
@@ -183,6 +237,7 @@ absl::StatusOr<std::vector<Tensor>> InferenceInterpreterDelegateRunner::Run(
     const int input_tensor_index = input_indices_excluding_feedback_tensors[i];
     const Tensor& input_tensor = tensor_span[i];
     if (input_tensor.shape().is_dynamic) {
+      RET_CHECK(!enable_zero_copy_tensor_io_) << "Zero-copy input shape must remain static.";
       const TfLiteTensor* interpreter_tensor =
           interpreter_->tensor(interpreter_->inputs()[input_tensor_index]);
       // TODO: Can avoid copying even these <= 4 values in the future.
@@ -197,7 +252,7 @@ absl::StatusOr<std::vector<Tensor>> InferenceInterpreterDelegateRunner::Run(
     }
   }
   // Reallocation is needed for memory sanity.
-  if (resized_tensor_shapes) interpreter_->AllocateTensors();
+  if (resized_tensor_shapes) RET_CHECK_EQ(interpreter_->AllocateTensors(), kTfLiteOk);
 
   // TODO: Replace this using the util function in
   // inference_calculator_utils.
@@ -207,6 +262,10 @@ absl::StatusOr<std::vector<Tensor>> InferenceInterpreterDelegateRunner::Run(
     // TODO b/329100795 - can TfLite custom allocation work with dynamic
     // tensors?
     if (enable_zero_copy_tensor_io_) {
+      ABSL_RETURN_IF_ERROR(TensorDimsAndTypeEqual(
+          input_tensor, *interpreter_->input_tensor(input_tensor_index)));
+      RET_CHECK_EQ(input_tensor.bytes(), interpreter_->input_tensor(input_tensor_index)->bytes)
+          << "Zero-copy input size differs from the model tensor.";
       auto input_tensor_view = input_tensor.GetCpuReadView();
       RET_CHECK(IsAlignedWithTFLiteDefaultAlignment(
           input_tensor_view.buffer<const void>()))
@@ -224,11 +283,10 @@ absl::StatusOr<std::vector<Tensor>> InferenceInterpreterDelegateRunner::Run(
   }
 
   ABSL_ASSIGN_OR_RETURN(
-      std::vector<Tensor> output_tensors,
+      output_tensors,
       AllocateOutputTensors(output_indices_excluding_feedback_tensors,
                             *interpreter_));
 
-  std::vector<Tensor::CpuWriteView> output_tensor_views;
   if (enable_zero_copy_tensor_io_) {
     for (int i = 0; i < output_indices_excluding_feedback_tensors.size(); ++i) {
       const int output_tensor_index =
@@ -245,7 +303,7 @@ absl::StatusOr<std::vector<Tensor>> InferenceInterpreterDelegateRunner::Run(
   // Reallocation is needed for memory sanity.
   if (resized_tensor_shapes || !input_tensor_views.empty() ||
       !output_tensor_views.empty()) {
-    interpreter_->AllocateTensors();
+    RET_CHECK_EQ(interpreter_->AllocateTensors(), kTfLiteOk);
   }
 
   // Run inference.
@@ -253,14 +311,11 @@ absl::StatusOr<std::vector<Tensor>> InferenceInterpreterDelegateRunner::Run(
     MEDIAPIPE_PROFILING(CPU_TASK_INVOKE, cc);
     RET_CHECK_EQ(interpreter_->Invoke(), kTfLiteOk);
   }
-  input_tensor_views.clear();
-  output_tensor_views.clear();
-
   if (enable_zero_copy_tensor_io_) {
-    // TODO b/340643988 -To avoid dangling pointers to Tensors that are not
-    // owned anymore by the InferenceRunner (once output tensors are passed to
-    // downstream calculators), we should invalidate TfLiteCustomAllocation
-    // assignments here.
+    ABSL_RETURN_IF_ERROR(RestoreIdleBindings());
+    std::move(detach_borrowed_tensors).Cancel();
+    input_tensor_views.clear();
+    output_tensor_views.clear();
   } else {
     // Copy output tensors from the interpreter.
     for (int i = 0; i < output_indices_excluding_feedback_tensors.size(); ++i) {
@@ -311,10 +366,12 @@ CreateInferenceInterpreterDelegateRunner(
   if (enable_zero_copy_tensor_io) {
     ABSL_RETURN_IF_ERROR(VerifyModelTensorsForCustomAllocation(*interpreter));
   }
-  return std::make_unique<InferenceInterpreterDelegateRunner>(
+  auto runner = std::make_unique<InferenceInterpreterDelegateRunner>(
       std::move(model), std::move(interpreter), std::move(delegate),
       std::move(input_output_tensor_names),
       std::move(inference_feedback_manager), enable_zero_copy_tensor_io);
+  ABSL_RETURN_IF_ERROR(runner->InitializeZeroCopyStorage());
+  return runner;
 }
 
 }  // namespace mediapipe

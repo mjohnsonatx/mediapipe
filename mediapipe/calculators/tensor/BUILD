@@ -943,6 +943,7 @@ cc_library_with_tflite(
         "//mediapipe/framework/formats:tensor",
         "//mediapipe/framework/port:ret_check",
         "//mediapipe/framework/port:status",
+        "@com_google_absl//absl/cleanup",
         "@com_google_absl//absl/container:flat_hash_set",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
@@ -1783,6 +1784,7 @@ cc_library(
         "@com_google_absl//absl/log:absl_log",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings:string_view",
+        "@litert//tflite:util",
     ] + select({
         "//mediapipe/gpu:disable_gpu": [],
         "//conditions:default": [":image_to_tensor_calculator_gpu_deps"],
@@ -1899,6 +1901,7 @@ cc_test(
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/types:optional",
+        "@litert//tflite:util",
     ] + select({
         "//mediapipe:apple": [],
         "//conditions:default": ["//mediapipe/gpu:gl_context"],

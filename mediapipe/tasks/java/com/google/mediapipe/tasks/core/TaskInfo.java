@@ -121,6 +121,7 @@ public abstract class TaskInfo<T extends TaskOptions> {
    */
   CalculatorGraphConfig generateGraphConfig() {
     CalculatorGraphConfig.Builder graphBuilder = CalculatorGraphConfig.newBuilder();
+    taskOptions().configureGraph(graphBuilder);
     CalculatorOptions options = taskOptions().convertToCalculatorOptionsProto();
     Any anyOptions = taskOptions().convertToAnyProto();
     if (!(options == null ^ anyOptions == null)) {

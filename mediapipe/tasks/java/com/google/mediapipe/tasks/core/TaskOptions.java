@@ -24,6 +24,14 @@ import com.google.protobuf.Any;
  * {@link TaskOptions} and implement exactly one of convertTo*Proto() methods.
  */
 public abstract class TaskOptions {
+  /** Optional top-level executor configuration, before graph initialization. */
+  public void configureGraph(com.google.mediapipe.proto.CalculatorProto.CalculatorGraphConfig.Builder graph) {}
+
+  protected final void configureCpuGraph(
+      com.google.mediapipe.proto.CalculatorProto.CalculatorGraphConfig.Builder graph,
+      BaseOptions options) {
+    BaseOptionsUtils.configureCpuGraph(graph, options);
+  }
   /**
    * Converts a MediaPipe Tasks task-specific options to a {@link CalculatorOptions} protobuf
    * message.

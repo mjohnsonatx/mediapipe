@@ -23,6 +23,10 @@ import android.content.pm.PackageManager.NameNotFoundException;
 import android.os.ParcelFileDescriptor;
 import com.google.common.io.ByteStreams;
 import com.google.mediapipe.calculator.proto.InferenceCalculatorProto;
+import com.google.mediapipe.proto.CalculatorProto.CalculatorGraphConfig;
+import com.google.mediapipe.proto.CalculatorProto.ExecutorConfig;
+import com.google.mediapipe.proto.MediaPipeOptionsProto.MediaPipeOptions;
+import com.google.mediapipe.proto.ThreadPoolExecutorOptionsProto.ThreadPoolExecutorOptions;
 import com.google.mediapipe.tasks.core.proto.AccelerationProto;
 import com.google.mediapipe.tasks.core.proto.BaseOptionsProto;
 import com.google.mediapipe.tasks.core.proto.ExternalFileProto;
@@ -159,14 +163,29 @@ public final class BaseOptionsUtils {
   private static void setDelegateOptions(
       AccelerationProto.Acceleration.Builder accelerationBuilder,
       BaseOptions.DelegateOptions.CpuOptions options) {
-    if (options.numThreads().isPresent()) {
-      accelerationBuilder.setXnnpack(
-          InferenceCalculatorProto.InferenceCalculatorOptions.Delegate.Xnnpack.newBuilder()
-              .setNumThreads(options.numThreads().get()));
+    if (options.numThreads().isPresent() || options.enableZeroCopyTensorIo().orElse(false)) {
+      InferenceCalculatorProto.InferenceCalculatorOptions.Delegate.Xnnpack.Builder xnnpack =
+          InferenceCalculatorProto.InferenceCalculatorOptions.Delegate.Xnnpack.newBuilder();
+      options.numThreads().ifPresent(xnnpack::setNumThreads);
+      options.enableZeroCopyTensorIo().ifPresent(xnnpack::setEnableZeroCopyTensorIo);
+      accelerationBuilder.setXnnpack(xnnpack);
     } else {
       accelerationBuilder.setTflite(
           InferenceCalculatorProto.InferenceCalculatorOptions.Delegate.TfLite.getDefaultInstance());
     }
+  }
+
+  static void configureCpuGraph(CalculatorGraphConfig.Builder graph, BaseOptions options) {
+    if (options.delegate() != Delegate.CPU || !options.delegateOptions().isPresent()) return;
+    BaseOptions.DelegateOptions.CpuOptions cpu =
+        (BaseOptions.DelegateOptions.CpuOptions) options.delegateOptions().get();
+    if (!cpu.graphNumThreads().isPresent()) return;
+    graph.addExecutor(ExecutorConfig.newBuilder().setName("").setType("ThreadPoolExecutor")
+        .setOptions(MediaPipeOptions.newBuilder().setExtension(ThreadPoolExecutorOptions.ext,
+            ThreadPoolExecutorOptions.newBuilder().setNumThreads(cpu.graphNumThreads().get())
+                .setThreadNamePrefix("MP-cpu").build())));
+    // No relative nice adjustment here. Workers inherit the app's verified construction
+    // mask/priority; XNNPACK helpers then inherit the graph workers' attributes.
   }
 
   private static void setDelegateOptions(

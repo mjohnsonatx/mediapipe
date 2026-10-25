@@ -498,6 +498,26 @@ public class PacketCreator {
             mediapipeGraph.getNativeHandle(), buffer, width, height, widthStep, numChannels));
   }
 
+  /**
+   * Borrows exact-capacity direct RGBA storage, without a native pixel copy. The caller must
+   * retain exclusive access until onRelease runs, including on graph failure or cancellation.
+   * Native ownership retains the buffer itself; the callback must not throw.
+   */
+  public Packet createBorrowedRgbaImage(
+      ByteBuffer buffer, int width, int height, Runnable onRelease) {
+    if (width <= 0 || height <= 0 || width > Integer.MAX_VALUE / 4
+        || height > Integer.MAX_VALUE / (width * 4)
+        || buffer == null || !buffer.isDirect() || onRelease == null
+        || (long) width * height * 4 != buffer.capacity()) {
+      throw new IllegalArgumentException("Borrowed RGBA input requires exact-capacity direct storage.");
+    }
+    return Packet.create(nativeCreateBorrowedRgbaImage(
+        mediapipeGraph.getNativeHandle(), buffer, width, height, onRelease));
+  }
+
+  private native long nativeCreateBorrowedRgbaImage(
+      long context, ByteBuffer buffer, int width, int height, Runnable onRelease);
+
   /** Helper callback adaptor to create the Java {@link GlSyncToken}. This is called by JNI code. */
   private void releaseWithSyncToken(long nativeSyncToken, TextureReleaseCallback releaseCallback) {
     releaseCallback.release(new GraphGlSyncToken(nativeSyncToken));

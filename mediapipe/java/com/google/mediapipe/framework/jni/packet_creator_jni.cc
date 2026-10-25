@@ -18,6 +18,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <string>
 #include <type_traits>
@@ -478,6 +479,49 @@ JNIEXPORT jlong JNICALL PACKET_CREATOR_METHOD(nativeCreateCpuImage)(
   mediapipe::Packet packet =
       mediapipe::MakePacket<mediapipe::Image>(*std::move(image_frame_or));
   return CreatePacketWithContext(context, packet);
+}
+
+JNIEXPORT jlong JNICALL PACKET_CREATOR_METHOD(nativeCreateBorrowedRgbaImage)(
+    JNIEnv* env, jobject thiz, jlong context, jobject byte_buffer, jint width,
+    jint height, jobject on_release) {
+  if (width <= 0 || height <= 0 || width > std::numeric_limits<int>::max() / 4 ||
+      height > std::numeric_limits<int>::max() / (width * 4)) {
+    ThrowIfError(env, absl::InvalidArgumentError("Borrowed RGBA image dimensions overflow storage."));
+    return 0L;
+  }
+  const int64_t expected = static_cast<int64_t>(width) * height * 4;
+  auto* pixels = static_cast<uint8_t*>(env->GetDirectBufferAddress(byte_buffer));
+  if (width <= 0 || height <= 0 || width > std::numeric_limits<int>::max() / 4 ||
+      expected > std::numeric_limits<int>::max() || pixels == nullptr ||
+      env->GetDirectBufferCapacity(byte_buffer) != expected || on_release == nullptr) {
+    ThrowIfError(env, absl::InvalidArgumentError(
+        "Borrowed RGBA image requires exact-capacity direct storage and positive dimensions."));
+    return 0L;
+  }
+  jclass callback_class = env->GetObjectClass(on_release);
+  if (callback_class == nullptr) return 0L;
+  jmethodID run = env->GetMethodID(callback_class, "run", "()V");
+  env->DeleteLocalRef(callback_class);
+  if (run == nullptr) return 0L;
+  jobject buffer_ref = env->NewGlobalRef(byte_buffer);
+  if (buffer_ref == nullptr) return 0L;
+  jobject release_ref = env->NewGlobalRef(on_release);
+  if (release_ref == nullptr) {
+    env->DeleteGlobalRef(buffer_ref);
+    return 0L;
+  }
+  auto frame = std::make_unique<mediapipe::ImageFrame>();
+  frame->AdoptPixelData(mediapipe::ImageFormat::SRGBA, width, height, width * 4, pixels,
+      [buffer_ref, release_ref, run](uint8_t*) {
+        // The app buffer owns the pixels. Release only our strong references, and acknowledge
+        // after the last native ImageFrame owner is gone (possibly on a graph worker).
+        JNIEnv* release_env = mediapipe::java::GetJNIEnv();
+        release_env->DeleteGlobalRef(buffer_ref);
+        release_env->CallVoidMethod(release_ref, run);
+        release_env->DeleteGlobalRef(release_ref);
+      });
+  return CreatePacketWithContext(context,
+      mediapipe::MakePacket<mediapipe::Image>(std::move(frame)));
 }
 
 #if !MEDIAPIPE_DISABLE_GPU
