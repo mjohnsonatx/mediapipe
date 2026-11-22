@@ -196,14 +196,18 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
       inputStreams.add("EXTERNAL_POSE_RECT:" + EXTERNAL_POSE_RECT_IN_STREAM_NAME);
       inputStreams.add(
           "USE_EXTERNAL_POSE_RECT:" + USE_EXTERNAL_POSE_RECT_IN_STREAM_NAME);
-      inputStreams.add(
-          "EXTERNAL_SOURCE_PROJECTION_RECT:"
-              + EXTERNAL_SOURCE_PROJECTION_RECT_IN_STREAM_NAME);
-      inputStreams.add(
-          "EXTERNAL_SOURCE_IMAGE_SIZE:" + EXTERNAL_SOURCE_IMAGE_SIZE_IN_STREAM_NAME);
-      inputStreams.add(
-          "USE_EXTERNAL_SOURCE_PROJECTION:"
-              + USE_EXTERNAL_SOURCE_PROJECTION_IN_STREAM_NAME);
+      // App-projection callers never use native source projection. Omitting the all-or-nothing
+      // trio removes three placeholder packets per frame and their AllowIf/Merge routing nodes.
+      if (landmarkerOptions.nativeSourceProjection().orElse(true)) {
+        inputStreams.add(
+            "EXTERNAL_SOURCE_PROJECTION_RECT:"
+                + EXTERNAL_SOURCE_PROJECTION_RECT_IN_STREAM_NAME);
+        inputStreams.add(
+            "EXTERNAL_SOURCE_IMAGE_SIZE:" + EXTERNAL_SOURCE_IMAGE_SIZE_IN_STREAM_NAME);
+        inputStreams.add(
+            "USE_EXTERNAL_SOURCE_PROJECTION:"
+                + USE_EXTERNAL_SOURCE_PROJECTION_IN_STREAM_NAME);
+      }
       inputStreams.add("RESET_TRACKING:" + RESET_TRACKING_IN_STREAM_NAME);
     }
     List<String> outputStreams = new ArrayList<>();
@@ -301,7 +305,9 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
             parentGlContext);
     return new PoseLandmarker(runner, landmarkerOptions.runningMode(),
         landmarkerOptions.borrowedImageInput().orElse(false),
-        landmarkerOptions.appTensorInput().orElse(false));
+        landmarkerOptions.appTensorInput().orElse(false),
+        landmarkerOptions.runningMode() == RunningMode.VIDEO
+            && landmarkerOptions.nativeSourceProjection().orElse(true));
   }
 
   @SuppressWarnings("ConstantCaseForConstants")
@@ -316,18 +322,24 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
    */
   private final boolean borrowedImageInput;
   private final boolean appTensorInput;
+  // True when the VIDEO graph connects the external source projection input trio.
+  private final boolean nativeSourceProjection;
   // Confined to the synchronous VIDEO caller; close follows the caller's inference drain.
   private Packet tensorImage;
   private Packet emptyTensorVector;
   private final java.util.concurrent.atomic.AtomicInteger borrowedImages =
       new java.util.concurrent.atomic.AtomicInteger();
   private final Runnable borrowedImageReleased = () -> borrowedImages.set(0);
+  // Sessions opened on this landmarker. Graph packets may reference their slots until graph
+  // teardown, so close() frees them only after the native graph is released.
+  private final List<PreparedPoseSession> preparedSessions = new ArrayList<>();
 
   private PoseLandmarker(TaskRunner taskRunner, RunningMode runningMode, boolean borrowedImageInput,
-      boolean appTensorInput) {
+      boolean appTensorInput, boolean nativeSourceProjection) {
     super(taskRunner, runningMode, IMAGE_IN_STREAM_NAME, NORM_RECT_IN_STREAM_NAME);
     this.borrowedImageInput = borrowedImageInput;
     this.appTensorInput = appTensorInput;
+    this.nativeSourceProjection = nativeSourceProjection;
   }
 
   /**
@@ -395,6 +407,13 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
     if (!appTensorInput) throw new IllegalStateException("Enable app tensor input at construction.");
   }
 
+  private void requireNativeSourceProjection() {
+    if (!nativeSourceProjection) {
+      throw new IllegalStateException(
+          "Native source projection was disabled when this landmarker was created.");
+    }
+  }
+
   private PoseLandmarkerResult processPreparedPoseTensor(Packet tensors, long timestampMs) {
     try {
       if (tensorImage == null) tensorImage = runner.getPacketCreator().createPoseTensorImage();
@@ -405,12 +424,245 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
     }
   }
 
+  /**
+   * Dedicated tracked-frame entry point: persistent prepared-tensor slots and a narrow
+   * submission that takes only a slot, a timestamp and the tracking-reset state.
+   *
+   * <p>Per frame: {@link #acquireSlot()}; fill {@link #cpuBuffer(int)} with 256x256x3 RGB floats
+   * in [0,1] (CPU storage) or write {@link #glBuffer(int)} on a context sharing this graph's
+   * parent context (GPU storage); then {@link #detect(int, long, boolean)}. An acquired slot that
+   * is not submitted must be returned with {@link #abandonSlot(int)}.
+   *
+   * <p>Native code caches the full-image metadata packets that the Tasks entry point rebuilds
+   * every frame, so the graph receives the same inputs and returns the same crop-local {@link
+   * PoseLandmarkerResult}. A slot returns to the pool only after the graph drops its last
+   * reference; a failure at or after submission poisons it until the landmarker is rebuilt.
+   *
+   * <p>Not thread-safe: the owner serializes every call, exactly as for detectForVideo. Buffers
+   * and SSBO names are valid until this landmarker closes and must not be touched afterwards.
+   */
+  public static final class PreparedPoseSession {
+    /** {@link #acquireSlot()} result: every usable slot is still referenced by the graph. */
+    public static final int SLOT_BUSY = -1;
+    /** {@link #acquireSlot()} result: every slot is poisoned; rebuild the landmarker. */
+    public static final int SLOTS_EXHAUSTED = -2;
+    /** Two slots let a completed frame release one while the next frame is prepared. */
+    public static final int SLOT_COUNT = 2;
+
+    private final PoseLandmarker owner;
+    private final boolean gpu;
+    private final ByteBuffer[] cpuBuffers;
+    private final int[] glBuffers;
+    // Zeroed by the owner's close(); every native call goes through requireOpen().
+    private volatile long handle;
+    // Arguments for the native submitter, valid only inside detect() under the runner lock.
+    private int pendingSlot;
+    private boolean pendingReset;
+    private boolean submitAttempted;
+    private final TaskRunner.NativeInputSubmitter submitter = this::submitPendingFrame;
+
+    private PreparedPoseSession(PoseLandmarker owner, long handle, boolean gpu,
+        ByteBuffer[] cpuBuffers, int[] glBuffers) {
+      this.owner = owner;
+      this.handle = handle;
+      this.gpu = gpu;
+      this.cpuBuffers = cpuBuffers;
+      this.glBuffers = glBuffers;
+    }
+
+    /** True for SSBO slots written on the GPU; false for CPU ByteBuffer slots. */
+    public boolean isGpu() {
+      return gpu;
+    }
+
+    /**
+     * Returns a writable slot index, {@link #SLOT_BUSY} while every usable slot is in flight, or
+     * {@link #SLOTS_EXHAUSTED} once every slot is poisoned.
+     */
+    public int acquireSlot() {
+      return owner.packets().acquirePreparedPoseSlot(requireOpen());
+    }
+
+    /** Persistent native-order RGB float storage for one CPU slot. */
+    public ByteBuffer cpuBuffer(int slot) {
+      requireOpen();
+      if (gpu) throw new IllegalStateException("GPU prepared pose session has no CPU slots.");
+      return cpuBuffers[slot];
+    }
+
+    /** Persistent SSBO name for one GPU slot (std430 float RGB, 256x256x3). */
+    public int glBuffer(int slot) {
+      requireOpen();
+      if (!gpu) throw new IllegalStateException("CPU prepared pose session has no GPU slots.");
+      return glBuffers[slot];
+    }
+
+    /** Returns an acquired but unsubmitted slot to the pool; a submitted slot is unaffected. */
+    public void abandonSlot(int slot) {
+      owner.packets().releasePreparedPoseSlot(requireOpen(), slot, /* poison= */ false);
+    }
+
+    /**
+     * Submits an acquired, fully written slot and waits for the synchronized result. A reset
+     * armed through {@link PoseLandmarker#resetTracking()} is also consumed here, so both entry
+     * points share one reset contract. GPU storage must be called with the writing context
+     * current; native code fences that write without a CPU wait.
+     */
+    public PoseLandmarkerResult detect(int slot, long timestampMs, boolean resetTracking) {
+      long session = requireOpen();
+      boolean reset = owner.resetTrackingPending.getAndSet(false) || resetTracking;
+      pendingSlot = slot;
+      pendingReset = reset;
+      submitAttempted = false;
+      try {
+        return owner.processPreparedSessionFrame(submitter, timestampMs);
+      } catch (RuntimeException | Error failure) {
+        // Before submission the slot is unreferenced and returns to the pool. At or after
+        // submission the graph may still reference it or have a GPU read pending.
+        try {
+          owner.packets().releasePreparedPoseSlot(session, slot, submitAttempted);
+        } catch (RuntimeException | Error cleanup) {
+          failure.addSuppressed(cleanup);
+        }
+        throw failure;
+      }
+    }
+
+    private void submitPendingFrame(long inputTimestamp) {
+      submitAttempted = true;
+      owner.packets().submitPreparedPoseFrame(
+          requireOpen(), pendingSlot, inputTimestamp, pendingReset);
+    }
+
+    private long requireOpen() {
+      long current = handle;
+      if (current == 0) throw new IllegalStateException("Prepared pose session is closed.");
+      return current;
+    }
+
+    /** Owner-only: closes the Java side and returns the native handle to free, or zero. */
+    private long detach() {
+      long current = handle;
+      handle = 0;
+      return current;
+    }
+  }
+
+  private com.google.mediapipe.framework.AndroidPacketCreator packets() {
+    return runner.getPacketCreator();
+  }
+
+  /** Same synchronous VIDEO contract as processVideoPackets(), with natively cached inputs. */
+  private PoseLandmarkerResult processPreparedSessionFrame(
+      TaskRunner.NativeInputSubmitter submitter, long timestampMs) {
+    if (runningMode != RunningMode.VIDEO) {
+      throw new MediaPipeException(
+          MediaPipeException.StatusCode.FAILED_PRECONDITION.ordinal(),
+          "Prepared pose sessions require the video running mode.");
+    }
+    PoseLandmarkerResult result = (PoseLandmarkerResult) runner.processNativeInputs(
+        submitter, timestampMs * MICROSECONDS_PER_MILLISECOND);
+    if (result == null) {
+      throw new MediaPipeException(
+          MediaPipeException.StatusCode.INTERNAL.ordinal(),
+          "Pose landmarker graph produced no synchronized output for prepared timestampMs="
+              + timestampMs);
+    }
+    return result;
+  }
+
+  /**
+   * Opens a dedicated tracked-frame session with {@link PreparedPoseSession#SLOT_COUNT}
+   * persistent input slots. GPU storage requires a landmarker created with a parent GL context,
+   * and the caller's current context must share that parent. Sessions live until {@link
+   * #close()}, which frees them only after graph teardown.
+   */
+  public synchronized PreparedPoseSession openPreparedPoseSession(boolean gpuStorage) {
+    requireAppTensorInput();
+    if (runner.isGraphReleased()) {
+      throw new IllegalStateException("Cannot open a prepared pose session on a closed landmarker.");
+    }
+    com.google.mediapipe.framework.AndroidPacketCreator creator = packets();
+    // Exactly the inputs processPreparedPoseTensor() sends, minus the tensor and reset packets
+    // that change every frame. Order: [tensor, reset, metadata...] paired with metadata packets.
+    List<String> streams = new ArrayList<>();
+    List<Packet> metadata = new ArrayList<>();
+    long handle = 0;
+    try {
+      streams.add(EXTERNAL_TENSORS_IN_STREAM_NAME);
+      streams.add(RESET_TRACKING_IN_STREAM_NAME);
+      streams.add(IMAGE_IN_STREAM_NAME);
+      metadata.add(creator.createPoseTensorImage());
+      streams.add(NORM_RECT_IN_STREAM_NAME);
+      metadata.add(creator.createProto(FULL_IMAGE_TRACKING_RECT.toProto()));
+      streams.add(EXTERNAL_POSE_RECT_IN_STREAM_NAME);
+      metadata.add(creator.createProto(FULL_IMAGE_TRACKING_RECT.toProto()));
+      streams.add(USE_EXTERNAL_POSE_RECT_IN_STREAM_NAME);
+      metadata.add(creator.createBool(true));
+      if (nativeSourceProjection) {
+        streams.add(EXTERNAL_SOURCE_PROJECTION_RECT_IN_STREAM_NAME);
+        metadata.add(creator.createProto(FULL_IMAGE_TRACKING_RECT.toProto()));
+        streams.add(EXTERNAL_SOURCE_IMAGE_SIZE_IN_STREAM_NAME);
+        metadata.add(creator.createInt32Pair(256, 256));
+        streams.add(USE_EXTERNAL_SOURCE_PROJECTION_IN_STREAM_NAME);
+        metadata.add(creator.createBool(false));
+      }
+      handle = creator.createPreparedPoseSession(gpuStorage, PreparedPoseSession.SLOT_COUNT,
+          streams.toArray(new String[0]), metadata.toArray(new Packet[0]));
+      ByteBuffer[] cpuBuffers = gpuStorage ? null : new ByteBuffer[PreparedPoseSession.SLOT_COUNT];
+      int[] glBuffers = gpuStorage ? new int[PreparedPoseSession.SLOT_COUNT] : null;
+      for (int slot = 0; slot < PreparedPoseSession.SLOT_COUNT; ++slot) {
+        if (gpuStorage) {
+          glBuffers[slot] = creator.getPreparedPoseGlBuffer(handle, slot);
+        } else {
+          cpuBuffers[slot] = creator.getPreparedPoseCpuBuffer(handle, slot);
+        }
+      }
+      PreparedPoseSession session =
+          new PreparedPoseSession(this, handle, gpuStorage, cpuBuffers, glBuffers);
+      preparedSessions.add(session);
+      handle = 0; // Ownership moved to close().
+      return session;
+    } finally {
+      // No slot was submitted yet, so a failed open can free its native session immediately.
+      if (handle != 0) {
+        creator.destroyPreparedPoseSession(handle);
+      }
+      for (Packet packet : metadata) {
+        packet.release();
+      }
+    }
+  }
+
   @Override public void close() {
     // Packet handles belong to Graph's registry and cannot be released after teardown. Any
     // in-flight graph packets hold independent references to the immutable payloads.
     if (tensorImage != null) { tensorImage.release(); tensorImage = null; }
     if (emptyTensorVector != null) { emptyTensorVector.release(); emptyTensorVector = null; }
-    super.close();
+    try {
+      super.close();
+    } finally {
+      releasePreparedSessions();
+    }
+  }
+
+  private synchronized void releasePreparedSessions() {
+    if (preparedSessions.isEmpty()) return;
+    // Slot packets can stay referenced until graph teardown releases them; freeing a session
+    // earlier would leave dangling foreign packets. If teardown did not complete, leak the
+    // sessions (a few MB) rather than risk a use-after-free.
+    boolean graphReleased = runner.isGraphReleased();
+    for (PreparedPoseSession session : preparedSessions) {
+      long handle = session.detach();
+      if (handle != 0 && graphReleased) {
+        packets().destroyPreparedPoseSession(handle);
+      }
+    }
+    if (!graphReleased) {
+      android.util.Log.w(TAG, "Graph teardown incomplete; leaked " + preparedSessions.size()
+          + " prepared pose session(s) to avoid freeing slots the graph may still reference.");
+    }
+    preparedSessions.clear();
   }
 
   /**
@@ -630,6 +882,7 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
       int sourceImageWidth,
       int sourceImageHeight,
       long timestampMs) {
+    requireNativeSourceProjection();
     validateExternalPoseRect(sourceProjectionRect);
     validateSourceImageDimensions(sourceImageWidth, sourceImageHeight);
     return processVideoData(
@@ -694,6 +947,7 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
       int sourceImageWidth,
       int sourceImageHeight,
       long timestampMs) {
+    requireNativeSourceProjection();
     validateExternalPoseRect(sourceProjectionRect);
     validateSourceImageDimensions(sourceImageWidth, sourceImageHeight);
     return processVideoTextureData(
@@ -849,18 +1103,24 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
       inputPackets.put(
           USE_EXTERNAL_POSE_RECT_IN_STREAM_NAME,
           runner.getPacketCreator().createBool(externalPoseRect.isPresent()));
-      inputPackets.put(
-          EXTERNAL_SOURCE_PROJECTION_RECT_IN_STREAM_NAME,
-          runner
-              .getPacketCreator()
-              .createProto(
-                  externalSourceProjectionRect.orElse(FULL_IMAGE_TRACKING_RECT).toProto()));
-      inputPackets.put(
-          EXTERNAL_SOURCE_IMAGE_SIZE_IN_STREAM_NAME,
-          runner.getPacketCreator().createInt32Pair(sourceImageWidth, sourceImageHeight));
-      inputPackets.put(
-          USE_EXTERNAL_SOURCE_PROJECTION_IN_STREAM_NAME,
-          runner.getPacketCreator().createBool(externalSourceProjectionRect.isPresent()));
+      if (nativeSourceProjection) {
+        inputPackets.put(
+            EXTERNAL_SOURCE_PROJECTION_RECT_IN_STREAM_NAME,
+            runner
+                .getPacketCreator()
+                .createProto(
+                    externalSourceProjectionRect.orElse(FULL_IMAGE_TRACKING_RECT).toProto()));
+        inputPackets.put(
+            EXTERNAL_SOURCE_IMAGE_SIZE_IN_STREAM_NAME,
+            runner.getPacketCreator().createInt32Pair(sourceImageWidth, sourceImageHeight));
+        inputPackets.put(
+            USE_EXTERNAL_SOURCE_PROJECTION_IN_STREAM_NAME,
+            runner.getPacketCreator().createBool(externalSourceProjectionRect.isPresent()));
+      } else if (externalSourceProjectionRect.isPresent()) {
+        // Public overloads reject this first; keep the graph contract explicit for new callers.
+        throw new IllegalStateException(
+            "Native source projection was disabled when this landmarker was created.");
+      }
       inputPackets.put(
           RESET_TRACKING_IN_STREAM_NAME,
           runner.getPacketCreator().createBool(resetTrackingPending.getAndSet(false)));
@@ -1011,6 +1271,12 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
       public abstract Builder setBorrowedImageInput(Boolean value);
       /** Opt-in single-pose VIDEO input; requires the matching prepared-tensor native graph. */
       public abstract Builder setAppTensorInput(Boolean value);
+      /**
+       * VIDEO graphs connect native source projection by default. Set false when the caller
+       * projects crop-local results itself; the overloads taking a source projection rectangle
+       * then throw, and every frame omits three placeholder packets and their routing nodes.
+       */
+      public abstract Builder setNativeSourceProjection(Boolean value);
 
       public abstract Builder setOutputSegmentationMasks(boolean value);
 
@@ -1076,6 +1342,7 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
     abstract Optional<Boolean> smoothLandmarks();
     abstract Optional<Boolean> borrowedImageInput();
     abstract Optional<Boolean> appTensorInput();
+    abstract Optional<Boolean> nativeSourceProjection();
 
     @Override
     public void configureGraph(com.google.mediapipe.proto.CalculatorProto.CalculatorGraphConfig.Builder graph) {

@@ -214,6 +214,40 @@ public class TaskRunner implements AutoCloseable {
     return outputHandler.retrieveCachedTaskResult();
   }
 
+  /** Adds every graph input packet for one timestamp from native code. */
+  public interface NativeInputSubmitter {
+    /** Must add a packet to every graph input stream at {@code inputTimestamp}, or throw. */
+    void submit(long inputTimestamp);
+  }
+
+  /**
+   * Synchronous VIDEO processing for clients whose input packets live natively, such as a
+   * prepared pose session. Same ordering and timestamp contract as {@link #process(Map, long)},
+   * but a submission failure always propagates: unlike {@code addPackets}, it is never logged and
+   * swallowed, because the caller must poison the native inputs it could not hand off.
+   */
+  public synchronized TaskResult processNativeInputs(
+      NativeInputSubmitter submitter, long inputTimestamp) {
+    if (!graphStarted.get()) {
+      throw new MediaPipeException(
+          MediaPipeException.StatusCode.FAILED_PRECONDITION.ordinal(),
+          "The task graph hasn't been successfully started or has been closed.");
+    }
+    validateInputTimestamp(inputTimestamp);
+    statsLogger.recordCpuInputArrival(inputTimestamp);
+    submitter.submit(inputTimestamp);
+    graph.waitUntilGraphIdle();
+    return outputHandler.retrieveCachedTaskResult();
+  }
+
+  /**
+   * True once the native graph was released. Native objects referenced by graph packets (for
+   * example prepared pose slots) may be freed only after this returns true.
+   */
+  public boolean isGraphReleased() {
+    return graph.getNativeHandle() == 0;
+  }
+
   /**
    * An asynchronous method for handling live streaming data.
    *

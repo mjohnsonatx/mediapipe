@@ -33,6 +33,24 @@ JNIEXPORT jlong JNICALL PACKET_CREATOR_METHOD(nativeCreatePoseTensorFromGlBuffer
 JNIEXPORT jlong JNICALL PACKET_CREATOR_METHOD(nativeCreatePoseTensorImage)(
     JNIEnv* env, jobject thiz, jlong context);
 
+// Prepared pose session: persistent tracked-frame input slots (see packet_creator_jni.cc).
+JNIEXPORT jlong JNICALL PACKET_CREATOR_METHOD(nativeCreatePreparedPoseSession)(
+    JNIEnv* env, jobject thiz, jlong context, jboolean gpu, jint slot_count,
+    jobjectArray streams, jlongArray constants);
+JNIEXPORT jobject JNICALL PACKET_CREATOR_METHOD(nativeGetPreparedPoseCpuBuffer)(
+    JNIEnv* env, jobject thiz, jlong session, jint slot);
+JNIEXPORT jint JNICALL PACKET_CREATOR_METHOD(nativeGetPreparedPoseGlBuffer)(
+    JNIEnv* env, jobject thiz, jlong session, jint slot);
+JNIEXPORT jint JNICALL PACKET_CREATOR_METHOD(nativeAcquirePreparedPoseSlot)(
+    JNIEnv* env, jobject thiz, jlong session);
+JNIEXPORT void JNICALL PACKET_CREATOR_METHOD(nativeReleasePreparedPoseSlot)(
+    JNIEnv* env, jobject thiz, jlong session, jint slot, jboolean poison);
+JNIEXPORT void JNICALL PACKET_CREATOR_METHOD(nativeSubmitPreparedPoseFrame)(
+    JNIEnv* env, jobject thiz, jlong context, jlong session, jint slot,
+    jlong timestamp, jboolean reset_tracking);
+JNIEXPORT void JNICALL PACKET_CREATOR_METHOD(nativeDestroyPreparedPoseSession)(
+    JNIEnv* env, jobject thiz, jlong session);
+
 JNIEXPORT jlong JNICALL PACKET_CREATOR_METHOD(nativeCreateReferencePacket)(
     JNIEnv* env, jobject thiz, jlong context, jlong packet);
 

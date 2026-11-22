@@ -223,6 +223,28 @@ void RegisterPacketCreatorNatives(JNIEnv* env) {
   AddJNINativeMethod(&packet_creator_methods, packet_creator,
                      "nativeCreatePoseTensorImage", "(J)J",
                      (void*)&PACKET_CREATOR_METHOD(nativeCreatePoseTensorImage));
+  // Signatures must match PacketCreator.java's private native declarations exactly.
+  AddJNINativeMethod(&packet_creator_methods, packet_creator,
+                     "nativeCreatePreparedPoseSession", "(JZI[Ljava/lang/String;[J)J",
+                     (void*)&PACKET_CREATOR_METHOD(nativeCreatePreparedPoseSession));
+  AddJNINativeMethod(&packet_creator_methods, packet_creator,
+                     "nativeGetPreparedPoseCpuBuffer", "(JI)Ljava/nio/ByteBuffer;",
+                     (void*)&PACKET_CREATOR_METHOD(nativeGetPreparedPoseCpuBuffer));
+  AddJNINativeMethod(&packet_creator_methods, packet_creator,
+                     "nativeGetPreparedPoseGlBuffer", "(JI)I",
+                     (void*)&PACKET_CREATOR_METHOD(nativeGetPreparedPoseGlBuffer));
+  AddJNINativeMethod(&packet_creator_methods, packet_creator,
+                     "nativeAcquirePreparedPoseSlot", "(J)I",
+                     (void*)&PACKET_CREATOR_METHOD(nativeAcquirePreparedPoseSlot));
+  AddJNINativeMethod(&packet_creator_methods, packet_creator,
+                     "nativeReleasePreparedPoseSlot", "(JIZ)V",
+                     (void*)&PACKET_CREATOR_METHOD(nativeReleasePreparedPoseSlot));
+  AddJNINativeMethod(&packet_creator_methods, packet_creator,
+                     "nativeSubmitPreparedPoseFrame", "(JJIJZ)V",
+                     (void*)&PACKET_CREATOR_METHOD(nativeSubmitPreparedPoseFrame));
+  AddJNINativeMethod(&packet_creator_methods, packet_creator,
+                     "nativeDestroyPreparedPoseSession", "(J)V",
+                     (void*)&PACKET_CREATOR_METHOD(nativeDestroyPreparedPoseSession));
   AddJNINativeMethod(&packet_creator_methods, packet_creator,
                      "nativeCreateRgbImage", "(JLjava/nio/ByteBuffer;II)J",
                      (void*)&PACKET_CREATOR_METHOD(nativeCreateRgbImage));

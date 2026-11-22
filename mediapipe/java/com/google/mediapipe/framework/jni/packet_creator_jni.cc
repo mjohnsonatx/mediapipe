@@ -16,6 +16,7 @@
 
 #include <jni.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -311,6 +312,336 @@ JNIEXPORT jlong JNICALL PACKET_CREATOR_METHOD(nativeCreatePoseTensorFromGlBuffer
   ThrowIfError(env, absl::UnimplementedError("Pose SSBO tensors require OpenGL ES 3.1."));
   return 0;
 #endif
+}
+
+// ---------------------------------------------------------------------------
+// Prepared pose session (r24): persistent tracked-frame input for one PoseLandmarker.
+//
+// Ownership contract (enforced by PoseLandmarker.PreparedPoseSession in Java):
+//   - One Java owner serializes acquire -> write -> submit under its exclusive lease.
+//   - A slot is reused only after the graph dropped its last packet reference. Reads of a GPU
+//     slot are complete by then: the synchronous VIDEO call read the model outputs on CPU, which
+//     orders every earlier GPU command, including the input read, before it returned.
+//   - Any failure at or after submission poisons the slot until the detector is rebuilt.
+//   - The session is destroyed only after graph teardown released every slot packet.
+// Per frame this replaces the Java packet map (8-9 JNI packet creations, 8-9 input calls and a
+// fresh tensor) with one acquire call and one submit call. Metadata packets are immutable
+// payloads created once and re-timestamped here.
+// ---------------------------------------------------------------------------
+namespace {
+
+enum PreparedPoseSlotState : int {
+  kPreparedPoseSlotFree = 0,      // Unreferenced by the graph; may be acquired.
+  kPreparedPoseSlotWriting = 1,   // Owned by the Java writer; not yet submitted.
+  kPreparedPoseSlotInFlight = 2,  // Referenced by graph packets until the foreign holder dies.
+  kPreparedPoseSlotPoisoned = 3,  // Indeterminate after a failure; never reused.
+};
+
+constexpr int kPreparedPoseTensorSize = 256;
+constexpr int kPreparedPoseMinSlots = 2;
+constexpr int kPreparedPoseMaxSlots = 4;
+constexpr jint kPreparedPoseSlotBusy = -1;
+constexpr jint kPreparedPoseSlotsExhausted = -2;
+
+struct PreparedPoseSlot {
+  // Exactly one [1,256,256,3] FLOAT32 tensor; a vector because the graph input carries one.
+  std::vector<mediapipe::Tensor> tensors;
+  std::atomic<int> state{kPreparedPoseSlotFree};
+  float* cpu = nullptr;  // CPU sessions: stable aligned storage behind a direct ByteBuffer.
+  jint gl_buffer = 0;    // GPU sessions: SSBO name shared with the app's parent GL context.
+};
+
+struct PreparedPoseSession {
+  bool gpu = false;
+  // unique_ptr keeps each slot (and its atomic) at a stable address for packet cleanups.
+  std::vector<std::unique_ptr<PreparedPoseSlot>> slots;
+  std::string tensor_stream;
+  std::string reset_stream;
+  std::vector<std::pair<std::string, mediapipe::Packet>> metadata;
+  mediapipe::Packet reset_true;
+  mediapipe::Packet reset_false;
+  int next_slot = 0;  // Writer-serialized round robin.
+};
+
+PreparedPoseSession* PreparedPoseSessionFromHandle(jlong handle) {
+  return reinterpret_cast<PreparedPoseSession*>(handle);
+}
+
+absl::StatusOr<PreparedPoseSlot*> PreparedPoseSlotFromHandle(jlong handle,
+                                                             jint slot) {
+  PreparedPoseSession* session = PreparedPoseSessionFromHandle(handle);
+  RET_CHECK(session != nullptr) << "Prepared pose session is closed.";
+  RET_CHECK(slot >= 0 && slot < static_cast<jint>(session->slots.size()))
+      << "Prepared pose slot " << slot << " is out of range.";
+  return session->slots[slot].get();
+}
+
+absl::StatusOr<std::unique_ptr<PreparedPoseSession>> CreatePreparedPoseSession(
+    JNIEnv* env, jlong context, jboolean gpu, jint slot_count,
+    jobjectArray streams, jlongArray constants) {
+  auto* graph = reinterpret_cast<mediapipe::android::Graph*>(context);
+  RET_CHECK(graph != nullptr) << "Prepared pose session needs a live graph.";
+  RET_CHECK(slot_count >= kPreparedPoseMinSlots &&
+            slot_count <= kPreparedPoseMaxSlots)
+      << "Prepared pose session needs " << kPreparedPoseMinSlots << " to "
+      << kPreparedPoseMaxSlots << " slots, got " << slot_count;
+  RET_CHECK(streams != nullptr && constants != nullptr)
+      << "Prepared pose session needs stream names and metadata packets.";
+  const jsize stream_count = env->GetArrayLength(streams);
+  const jsize constant_count = env->GetArrayLength(constants);
+  // [0] tensor stream, [1] reset stream, [2..] metadata streams paired with constants.
+  RET_CHECK(stream_count >= 3 && constant_count == stream_count - 2)
+      << "Prepared pose session got " << stream_count << " streams and "
+      << constant_count << " metadata packets.";
+
+  auto session = std::make_unique<PreparedPoseSession>();
+  session->gpu = gpu == JNI_TRUE;
+  std::vector<std::string> names;
+  names.reserve(stream_count);
+  for (jsize i = 0; i < stream_count; ++i) {
+    auto* name = static_cast<jstring>(env->GetObjectArrayElement(streams, i));
+    RET_CHECK(name != nullptr) << "Prepared pose stream " << i << " is null.";
+    names.push_back(mediapipe::android::JStringToStdString(env, name));
+    env->DeleteLocalRef(name);
+    RET_CHECK(!names.back().empty()) << "Prepared pose stream " << i << " is empty.";
+  }
+  std::vector<jlong> handles(constant_count);
+  env->GetLongArrayRegion(constants, 0, constant_count, handles.data());
+  session->tensor_stream = names[0];
+  session->reset_stream = names[1];
+  for (jsize i = 0; i < constant_count; ++i) {
+    RET_CHECK(handles[i] != 0) << "Prepared pose metadata packet " << i << " is missing.";
+    // Copies share the immutable payload; the Java caller releases its own handles.
+    session->metadata.emplace_back(
+        names[i + 2], mediapipe::android::Graph::GetPacketFromHandle(handles[i]));
+  }
+  session->reset_true = mediapipe::MakePacket<bool>(true);
+  session->reset_false = mediapipe::MakePacket<bool>(false);
+
+  for (jint i = 0; i < slot_count; ++i) {
+    auto slot = std::make_unique<PreparedPoseSlot>();
+    // No memory manager: pooled storage is tied to the graph's lifetime, and a CPU slot must
+    // keep one stable pointer for its Java ByteBuffer. 64-byte alignment matches the XNNPACK
+    // zero-copy input binding used by the per-frame route.
+    slot->tensors.emplace_back(
+        mediapipe::Tensor::ElementType::kFloat32,
+        mediapipe::Tensor::Shape{1, kPreparedPoseTensorSize,
+                                 kPreparedPoseTensorSize, 3},
+        /*memory_manager=*/nullptr, /*memory_alignment=*/64);
+    session->slots.push_back(std::move(slot));
+  }
+
+  if (!session->gpu) {
+    for (auto& slot : session->slots) {
+      const mediapipe::Tensor& tensor = slot->tensors.front();
+      auto view = tensor.GetCpuWriteView();
+      slot->cpu = view.buffer<float>();
+      RET_CHECK(slot->cpu != nullptr) << "Prepared pose CPU slot allocation failed.";
+      // Defined contents before the first write; every frame overwrites all values.
+      std::memset(slot->cpu, 0, tensor.bytes());
+    }
+    return session;
+  }
+#if !MEDIAPIPE_DISABLE_GPU && MEDIAPIPE_OPENGL_ES_VERSION >= MEDIAPIPE_OPENGL_ES_31
+  auto* resources = graph->GetGpuResources();
+  RET_CHECK(resources != nullptr)
+      << "GPU prepared pose slots need a graph created with a parent GL context.";
+  PreparedPoseSession* raw = session.get();
+  ABSL_RETURN_IF_ERROR(resources->gl_context()->Run([raw]() -> absl::Status {
+    for (auto& slot : raw->slots) {
+      // Allocates the SSBO on the graph context, whose share group includes the app context.
+      auto view = slot->tensors.front().GetOpenGlBufferWriteView();
+      slot->gl_buffer = static_cast<jint>(view.name());
+      RET_CHECK(slot->gl_buffer != 0) << "Prepared pose GPU slot allocation failed.";
+    }
+    glFlush();
+    const GLenum error = glGetError();
+    RET_CHECK(error == GL_NO_ERROR)
+        << "Prepared pose GPU slot allocation failed: GL error " << error;
+    return absl::OkStatus();
+  }));
+  return session;
+#else
+  return absl::UnimplementedError("GPU prepared pose slots require OpenGL ES 3.1.");
+#endif
+}
+
+absl::Status SubmitPreparedPoseFrame(mediapipe::android::Graph* graph,
+                                     PreparedPoseSession* session, jint slot_index,
+                                     int64_t timestamp_us, bool reset_tracking) {
+  RET_CHECK(graph != nullptr) << "Prepared pose submission needs a live graph.";
+  RET_CHECK(session != nullptr) << "Prepared pose session is closed.";
+  ABSL_ASSIGN_OR_RETURN(PreparedPoseSlot * slot,
+                        PreparedPoseSlotFromHandle(
+                            reinterpret_cast<jlong>(session), slot_index));
+  RET_CHECK(slot->state.load(std::memory_order_acquire) == kPreparedPoseSlotWriting)
+      << "Prepared pose slot " << slot_index << " must be acquired and unsubmitted.";
+  // Any failure from here on leaves the slot's graph references or GPU ordering uncertain.
+  auto poison = absl::MakeCleanup([slot] {
+    slot->state.store(kPreparedPoseSlotPoisoned, std::memory_order_release);
+  });
+  const mediapipe::Tensor& tensor = slot->tensors.front();
+  if (session->gpu) {
+#if !MEDIAPIPE_DISABLE_GPU && MEDIAPIPE_OPENGL_ES_VERSION >= MEDIAPIPE_OPENGL_ES_31
+    auto* resources = graph->GetGpuResources();
+    RET_CHECK(resources != nullptr) << "GPU prepared pose slots need a GPU graph.";
+    // The app wrote the SSBO on the calling context; order graph reads after that write
+    // without a CPU wait.
+    GLsync producer = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    RET_CHECK(producer != nullptr) << "Could not fence the app pose tensor write.";
+    glFlush();
+    const absl::Status ordered =
+        resources->gl_context()->Run([producer, &tensor]() -> absl::Status {
+          glWaitSync(producer, 0, GL_TIMEOUT_IGNORED);
+          glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
+          // Re-arm: this frame's SSBO becomes the tensor's only valid representation, so no
+          // reader reuses a CPU copy taken from an earlier frame.
+          { auto view = tensor.GetOpenGlBufferWriteView(); }
+          const GLenum error = glGetError();
+          RET_CHECK(error == GL_NO_ERROR)
+              << "Could not order the prepared pose GPU slot for inference: GL error "
+              << error;
+          return absl::OkStatus();
+        });
+    glDeleteSync(producer);
+    ABSL_RETURN_IF_ERROR(ordered);
+#else
+    return absl::UnimplementedError("GPU prepared pose slots require OpenGL ES 3.1.");
+#endif
+  } else {
+    // Java filled the stable pointer. Re-arm CPU as the only valid representation so a
+    // GPU-delegate reader uploads this frame instead of reusing an earlier upload.
+    auto view = tensor.GetCpuWriteView();
+  }
+
+  const mediapipe::Timestamp timestamp =
+      mediapipe::Timestamp::CreateNoErrorChecking(timestamp_us);
+  for (const auto& [stream, packet] : session->metadata) {
+    ABSL_RETURN_IF_ERROR(graph->AddPacketToInputStream(stream, packet.At(timestamp)));
+  }
+  ABSL_RETURN_IF_ERROR(graph->AddPacketToInputStream(
+      session->reset_stream,
+      (reset_tracking ? session->reset_true : session->reset_false).At(timestamp)));
+  // The tensor goes last so a metadata failure never leaves the slot referenced.
+  slot->state.store(kPreparedPoseSlotInFlight, std::memory_order_release);
+  std::atomic<int>* state = &slot->state;
+  mediapipe::Packet tensors =
+      mediapipe::PointToForeign(&slot->tensors,
+                                [state]() {
+                                  // Last graph reference released. A poisoned slot stays
+                                  // poisoned; only an in-flight slot returns to the pool.
+                                  int in_flight = kPreparedPoseSlotInFlight;
+                                  state->compare_exchange_strong(
+                                      in_flight, kPreparedPoseSlotFree,
+                                      std::memory_order_acq_rel);
+                                })
+          .At(timestamp);
+  ABSL_RETURN_IF_ERROR(
+      graph->AddPacketToInputStream(session->tensor_stream, std::move(tensors)));
+  std::move(poison).Cancel();
+  return absl::OkStatus();
+}
+
+}  // namespace
+
+JNIEXPORT jlong JNICALL PACKET_CREATOR_METHOD(nativeCreatePreparedPoseSession)(
+    JNIEnv* env, jobject, jlong context, jboolean gpu, jint slot_count,
+    jobjectArray streams, jlongArray constants) {
+  auto session =
+      CreatePreparedPoseSession(env, context, gpu, slot_count, streams, constants);
+  if (!session.ok()) {
+    ThrowIfError(env, session.status());
+    return 0;
+  }
+  std::unique_ptr<PreparedPoseSession> owned = std::move(session).value();
+  return reinterpret_cast<jlong>(owned.release());
+}
+
+JNIEXPORT jobject JNICALL PACKET_CREATOR_METHOD(nativeGetPreparedPoseCpuBuffer)(
+    JNIEnv* env, jobject, jlong handle, jint slot) {
+  auto found = PreparedPoseSlotFromHandle(handle, slot);
+  if (!found.ok()) {
+    ThrowIfError(env, found.status());
+    return nullptr;
+  }
+  if (PreparedPoseSessionFromHandle(handle)->gpu || (*found)->cpu == nullptr) {
+    ThrowIfError(env, absl::InvalidArgumentError("Prepared pose slot is not CPU storage."));
+    return nullptr;
+  }
+  // Valid until the owner destroys the session after graph teardown.
+  return env->NewDirectByteBuffer((*found)->cpu, (*found)->tensors.front().bytes());
+}
+
+JNIEXPORT jint JNICALL PACKET_CREATOR_METHOD(nativeGetPreparedPoseGlBuffer)(
+    JNIEnv* env, jobject, jlong handle, jint slot) {
+  auto found = PreparedPoseSlotFromHandle(handle, slot);
+  if (!found.ok()) {
+    ThrowIfError(env, found.status());
+    return 0;
+  }
+  if (!PreparedPoseSessionFromHandle(handle)->gpu || (*found)->gl_buffer == 0) {
+    ThrowIfError(env, absl::InvalidArgumentError("Prepared pose slot is not GPU storage."));
+    return 0;
+  }
+  return (*found)->gl_buffer;
+}
+
+JNIEXPORT jint JNICALL PACKET_CREATOR_METHOD(nativeAcquirePreparedPoseSlot)(
+    JNIEnv* env, jobject, jlong handle) {
+  PreparedPoseSession* session = PreparedPoseSessionFromHandle(handle);
+  if (session == nullptr) {
+    ThrowIfError(env, absl::FailedPreconditionError("Prepared pose session is closed."));
+    return kPreparedPoseSlotsExhausted;
+  }
+  const int count = static_cast<int>(session->slots.size());
+  bool usable = false;
+  for (int offset = 0; offset < count; ++offset) {
+    const int index = (session->next_slot + offset) % count;
+    int expected = kPreparedPoseSlotFree;
+    if (session->slots[index]->state.compare_exchange_strong(
+            expected, kPreparedPoseSlotWriting, std::memory_order_acq_rel)) {
+      session->next_slot = (index + 1) % count;
+      return index;
+    }
+    if (expected != kPreparedPoseSlotPoisoned) usable = true;
+  }
+  // Busy: every usable slot is still referenced by the graph (transient). Exhausted: every slot
+  // is poisoned and the detector needs a drained rebuild.
+  return usable ? kPreparedPoseSlotBusy : kPreparedPoseSlotsExhausted;
+}
+
+JNIEXPORT void JNICALL PACKET_CREATOR_METHOD(nativeReleasePreparedPoseSlot)(
+    JNIEnv* env, jobject, jlong handle, jint slot, jboolean poison) {
+  auto found = PreparedPoseSlotFromHandle(handle, slot);
+  if (!found.ok()) {
+    ThrowIfError(env, found.status());
+    return;
+  }
+  if (poison == JNI_TRUE) {
+    (*found)->state.store(kPreparedPoseSlotPoisoned, std::memory_order_release);
+    return;
+  }
+  // Only an unsubmitted slot returns here; a submitted slot is released by its packet cleanup.
+  int writing = kPreparedPoseSlotWriting;
+  (*found)->state.compare_exchange_strong(writing, kPreparedPoseSlotFree,
+                                          std::memory_order_acq_rel);
+}
+
+JNIEXPORT void JNICALL PACKET_CREATOR_METHOD(nativeSubmitPreparedPoseFrame)(
+    JNIEnv* env, jobject, jlong context, jlong handle, jint slot, jlong timestamp,
+    jboolean reset_tracking) {
+  const absl::Status status = SubmitPreparedPoseFrame(
+      reinterpret_cast<mediapipe::android::Graph*>(context),
+      PreparedPoseSessionFromHandle(handle), slot, timestamp,
+      reset_tracking == JNI_TRUE);
+  if (!status.ok()) ThrowIfError(env, status);
+}
+
+JNIEXPORT void JNICALL PACKET_CREATOR_METHOD(nativeDestroyPreparedPoseSession)(
+    JNIEnv*, jobject, jlong handle) {
+  // Called only after graph teardown released every packet that referenced a slot. GPU tensors
+  // release their SSBOs through the GlContext they retain.
+  delete PreparedPoseSessionFromHandle(handle);
 }
 
 JNIEXPORT jlong JNICALL PACKET_CREATOR_METHOD(nativeCreateReferencePacket)(

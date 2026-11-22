@@ -91,10 +91,73 @@ public class PacketCreator {
     return Packet.create(nativeCreatePoseTensorImage(mediapipeGraph.getNativeHandle()));
   }
 
+  /**
+   * Creates a native prepared-pose session with {@code slotCount} persistent [1,256,256,3]
+   * FLOAT32 input slots (CPU storage, or GPU SSBOs on this graph's shared GL context).
+   *
+   * <p>{@code streams[0]} is the tensor input stream, {@code streams[1]} the reset stream, and
+   * {@code streams[i + 2]} receives {@code metadata[i]} re-timestamped every frame. The session
+   * copies the metadata payload references; the caller still releases its own packets. Destroy
+   * the returned handle only after graph teardown released every submitted slot.
+   */
+  public long createPreparedPoseSession(
+      boolean gpu, int slotCount, String[] streams, Packet[] metadata) {
+    if (streams == null || metadata == null || streams.length != metadata.length + 2) {
+      throw new IllegalArgumentException("Prepared pose session needs tensor, reset and metadata streams.");
+    }
+    long[] handles = new long[metadata.length];
+    for (int i = 0; i < metadata.length; ++i) {
+      handles[i] = metadata[i].getNativeHandle();
+    }
+    return nativeCreatePreparedPoseSession(
+        mediapipeGraph.getNativeHandle(), gpu, slotCount, streams, handles);
+  }
+
+  /** Stable native-order view of one CPU slot; valid until the session is destroyed. */
+  public ByteBuffer getPreparedPoseCpuBuffer(long session, int slot) {
+    return nativeGetPreparedPoseCpuBuffer(session, slot).order(ByteOrder.nativeOrder());
+  }
+
+  /** SSBO name of one GPU slot, valid on contexts sharing this graph's parent context. */
+  public int getPreparedPoseGlBuffer(long session, int slot) {
+    return nativeGetPreparedPoseGlBuffer(session, slot);
+  }
+
+  /** Returns a writable slot index, -1 while every usable slot is in flight, or -2 if all are poisoned. */
+  public int acquirePreparedPoseSlot(long session) {
+    return nativeAcquirePreparedPoseSlot(session);
+  }
+
+  /** Returns an unsubmitted slot to the pool, or poisons a slot whose ownership is uncertain. */
+  public void releasePreparedPoseSlot(long session, int slot, boolean poison) {
+    nativeReleasePreparedPoseSlot(session, slot, poison);
+  }
+
+  /** Adds every input packet for one tracked frame. Native code poisons the slot on failure. */
+  public void submitPreparedPoseFrame(
+      long session, int slot, long timestampUs, boolean resetTracking) {
+    nativeSubmitPreparedPoseFrame(
+        mediapipeGraph.getNativeHandle(), session, slot, timestampUs, resetTracking);
+  }
+
+  /** Frees the session. Call only after graph teardown, or before any slot was submitted. */
+  public void destroyPreparedPoseSession(long session) {
+    nativeDestroyPreparedPoseSession(session);
+  }
+
   private native long nativeCreatePoseTensor(long context, boolean allocate);
   private native ByteBuffer nativeGetCpuPoseTensorBuffer(long packet);
   private native long nativeCreatePoseTensorFromGlBuffer(long context, int buffer);
   private native long nativeCreatePoseTensorImage(long context);
+  private native long nativeCreatePreparedPoseSession(
+      long context, boolean gpu, int slotCount, String[] streams, long[] metadata);
+  private native ByteBuffer nativeGetPreparedPoseCpuBuffer(long session, int slot);
+  private native int nativeGetPreparedPoseGlBuffer(long session, int slot);
+  private native int nativeAcquirePreparedPoseSlot(long session);
+  private native void nativeReleasePreparedPoseSlot(long session, int slot, boolean poison);
+  private native void nativeSubmitPreparedPoseFrame(
+      long context, long session, int slot, long timestamp, boolean resetTracking);
+  private native void nativeDestroyPreparedPoseSession(long session);
 
   /**
    * Create a MediaPipe Packet that contains a pointer to another MediaPipe packet.
