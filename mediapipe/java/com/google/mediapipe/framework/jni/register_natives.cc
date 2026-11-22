@@ -245,6 +245,10 @@ void RegisterPacketCreatorNatives(JNIEnv* env) {
   AddJNINativeMethod(&packet_creator_methods, packet_creator,
                      "nativeDestroyPreparedPoseSession", "(J)V",
                      (void*)&PACKET_CREATOR_METHOD(nativeDestroyPreparedPoseSession));
+  // r25 flat pose result (static native on PacketCreator).
+  AddJNINativeMethod(&packet_creator_methods, packet_creator,
+                     "nativeWriteFlatPoseResult", "(JJJJZ[F)Z",
+                     (void*)&PACKET_CREATOR_METHOD(nativeWriteFlatPoseResult));
   AddJNINativeMethod(&packet_creator_methods, packet_creator,
                      "nativeCreateRgbImage", "(JLjava/nio/ByteBuffer;II)J",
                      (void*)&PACKET_CREATOR_METHOD(nativeCreateRgbImage));

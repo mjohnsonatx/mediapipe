@@ -16,7 +16,9 @@
 
 #include <jni.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -28,13 +30,16 @@
 
 #include "absl/cleanup/cleanup.h"
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "mediapipe/framework/calculator.pb.h"
 #include "mediapipe/framework/camera_intrinsics.h"
 #include "mediapipe/framework/formats/image.h"
 #include "mediapipe/framework/formats/image_format.pb.h"
 #include "mediapipe/framework/formats/image_frame.h"
+#include "mediapipe/framework/formats/landmark.pb.h"
 #include "mediapipe/framework/formats/matrix.h"
+#include "mediapipe/framework/formats/rect.pb.h"
 #include "mediapipe/framework/formats/tensor.h"
 #include "mediapipe/framework/formats/time_series_header.pb.h"
 #include "mediapipe/framework/formats/video_stream_header.h"
@@ -403,7 +408,7 @@ absl::StatusOr<std::unique_ptr<PreparedPoseSession>> CreatePreparedPoseSession(
     RET_CHECK(name != nullptr) << "Prepared pose stream " << i << " is null.";
     names.push_back(mediapipe::android::JStringToStdString(env, name));
     env->DeleteLocalRef(name);
-    RET_CHECK(!names.back().empty()) << "Prepared pose stream " << i << " is empty.";
+    RET_CHECK(i == 1 || !names.back().empty()) << "Prepared pose stream " << i << " is empty.";
   }
   std::vector<jlong> handles(constant_count);
   env->GetLongArrayRegion(constants, 0, constant_count, handles.data());
@@ -480,6 +485,8 @@ absl::Status SubmitPreparedPoseFrame(mediapipe::android::Graph* graph,
   auto poison = absl::MakeCleanup([slot] {
     slot->state.store(kPreparedPoseSlotPoisoned, std::memory_order_release);
   });
+  RET_CHECK(!session->reset_stream.empty() || !reset_tracking)
+      << "Stateless prepared pose session cannot reset tracking.";
   const mediapipe::Tensor& tensor = slot->tensors.front();
   if (session->gpu) {
 #if !MEDIAPIPE_DISABLE_GPU && MEDIAPIPE_OPENGL_ES_VERSION >= MEDIAPIPE_OPENGL_ES_31
@@ -519,9 +526,11 @@ absl::Status SubmitPreparedPoseFrame(mediapipe::android::Graph* graph,
   for (const auto& [stream, packet] : session->metadata) {
     ABSL_RETURN_IF_ERROR(graph->AddPacketToInputStream(stream, packet.At(timestamp)));
   }
-  ABSL_RETURN_IF_ERROR(graph->AddPacketToInputStream(
-      session->reset_stream,
-      (reset_tracking ? session->reset_true : session->reset_false).At(timestamp)));
+  if (!session->reset_stream.empty()) {
+    ABSL_RETURN_IF_ERROR(graph->AddPacketToInputStream(
+        session->reset_stream,
+        (reset_tracking ? session->reset_true : session->reset_false).At(timestamp)));
+  }
   // The tensor goes last so a metadata failure never leaves the slot referenced.
   slot->state.store(kPreparedPoseSlotInFlight, std::memory_order_release);
   std::atomic<int>* state = &slot->state;
@@ -540,6 +549,184 @@ absl::Status SubmitPreparedPoseFrame(mediapipe::android::Graph* graph,
       graph->AddPacketToInputStream(session->tensor_stream, std::move(tensors)));
   std::move(poison).Cancel();
   return absl::OkStatus();
+}
+
+// ---------------------------------------------------------------------------
+// Flat single-pose result (r25). Replaces three proto-vector serializations, Java proto parsing
+// and ~100 Java value objects per synchronous VIDEO frame with one bounded array copy.
+//
+// Layout, in float words. Must match PoseLandmarker.FlatPoseResult in the vision AAR; the leading
+// version word lets Java reject a mismatched core/vision pair instead of reading shifted offsets.
+//   [0]        layout version
+//   [1]        flags: pose present 1, pose detector ran 2, native next-frame rect present 4,
+//              a supplied visibility/presence was NaN 8 (so NaN-as-omitted stays unambiguous)
+//   [2]        image landmark count          [3] world landmark count
+//   [4]        auxiliary landmark count      [5] poses in the native output (the first is written)
+//   [6..10]    native next-frame rect: x_center, y_center, width, height, rotation
+//   [11..175]  33 image landmarks: x, y, z, visibility, presence (NaN when the proto omits a field)
+//   [176..274] 33 world landmarks: x, y, z in meters
+//   [275..278] 2 auxiliary tracking landmarks: x, y normalized to the graph input image
+// Every slot without data is NaN, so a reader can never mistake stale storage for a coordinate.
+// Counts and flags are small integers, exactly representable as float.
+// ---------------------------------------------------------------------------
+constexpr int kFlatPoseLayoutVersion = 1;
+constexpr int kFlatPoseVersionIndex = 0;
+constexpr int kFlatPoseFlagsIndex = 1;
+constexpr int kFlatPoseLandmarkCountIndex = 2;
+constexpr int kFlatPoseWorldCountIndex = 3;
+constexpr int kFlatPoseAuxiliaryCountIndex = 4;
+constexpr int kFlatPosePoseCountIndex = 5;
+constexpr int kFlatPoseNativeRectIndex = 6;
+constexpr int kFlatPoseLandmarksIndex = 11;
+constexpr int kFlatPoseLandmarkStride = 5;
+constexpr int kFlatPoseMaxLandmarks = 33;
+constexpr int kFlatPoseWorldIndex =
+    kFlatPoseLandmarksIndex + kFlatPoseLandmarkStride * kFlatPoseMaxLandmarks;
+constexpr int kFlatPoseWorldStride = 3;
+constexpr int kFlatPoseAuxiliaryIndex =
+    kFlatPoseWorldIndex + kFlatPoseWorldStride * kFlatPoseMaxLandmarks;
+constexpr int kFlatPoseAuxiliaryStride = 2;
+constexpr int kFlatPoseMaxAuxiliary = 2;
+constexpr int kFlatPoseSize =
+    kFlatPoseAuxiliaryIndex + kFlatPoseAuxiliaryStride * kFlatPoseMaxAuxiliary;
+constexpr int kFlatPoseFlagPosePresent = 1;
+constexpr int kFlatPoseFlagDetectorRan = 2;
+constexpr int kFlatPoseFlagNativeRect = 4;
+constexpr int kFlatPoseFlagSuppliedNaNConfidence = 8;
+static_assert(kFlatPoseWorldIndex == 176, "Update PoseLandmarker.FlatPoseResult.WORLD_INDEX");
+static_assert(kFlatPoseAuxiliaryIndex == 275,
+              "Update PoseLandmarker.FlatPoseResult.AUXILIARY_INDEX");
+static_assert(kFlatPoseSize == 279, "Update PoseLandmarker.FlatPoseResult.SIZE");
+
+// The Java packet objects own these references for the duration of the output callback; the
+// copies taken here only keep the payloads alive while this function reads them.
+mediapipe::Packet FlatPosePacket(jlong handle) {
+  return handle == 0 ? mediapipe::Packet()
+                     : mediapipe::android::Graph::GetPacketFromHandle(handle);
+}
+
+// Typed view of one vector stream, or nullptr when the stream is absent at this timestamp. A
+// wrong type would abort the process inside Get(), so it is reported as a recoverable status.
+template <typename T>
+absl::StatusOr<const std::vector<T>*> FlatPoseVector(
+    const mediapipe::Packet& packet, const char* stream) {
+  if (packet.IsEmpty()) return static_cast<const std::vector<T>*>(nullptr);
+  const absl::Status valid = packet.ValidateAsType<std::vector<T>>();
+  if (!valid.ok()) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "Flat pose stream ", stream, " has an unexpected type: ", valid.message()));
+  }
+  return &packet.Get<std::vector<T>>();
+}
+
+// Fills `out` (kFlatPoseSize floats). Returns whether the graph produced a pose. Never touches
+// JNI, so a failure leaves the caller's Java array unmodified.
+absl::StatusOr<bool> WriteFlatPoseResult(jlong landmarks_handle, jlong world_handle,
+                                         jlong auxiliary_handle, jlong rects_handle,
+                                         bool pose_detector_ran, float* out) {
+  const float nan = std::numeric_limits<float>::quiet_NaN();
+  std::fill(out, out + kFlatPoseSize, nan);
+
+  const mediapipe::Packet landmarks_packet = FlatPosePacket(landmarks_handle);
+  const mediapipe::Packet world_packet = FlatPosePacket(world_handle);
+  const mediapipe::Packet auxiliary_packet = FlatPosePacket(auxiliary_handle);
+  const mediapipe::Packet rects_packet = FlatPosePacket(rects_handle);
+
+  const auto landmark_lists = FlatPoseVector<mediapipe::NormalizedLandmarkList>(
+      landmarks_packet, "landmarks");
+  if (!landmark_lists.ok()) return landmark_lists.status();
+  const auto world_lists =
+      FlatPoseVector<mediapipe::LandmarkList>(world_packet, "world_landmarks");
+  if (!world_lists.ok()) return world_lists.status();
+  const auto auxiliary_lists = FlatPoseVector<mediapipe::NormalizedLandmarkList>(
+      auxiliary_packet, "auxiliary_landmarks");
+  if (!auxiliary_lists.ok()) return auxiliary_lists.status();
+  const auto rects =
+      FlatPoseVector<mediapipe::NormalizedRect>(rects_packet, "pose_rects_next_frame");
+  if (!rects.ok()) return rects.status();
+
+  int flags = pose_detector_ran ? kFlatPoseFlagDetectorRan : 0;
+  int pose_count = 0;
+  int landmark_count = 0;
+  int world_count = 0;
+  int auxiliary_count = 0;
+
+  if (*landmark_lists != nullptr && !(*landmark_lists)->empty()) {
+    pose_count = static_cast<int>((*landmark_lists)->size());
+    flags |= kFlatPoseFlagPosePresent;
+    const mediapipe::NormalizedLandmarkList& pose = (*landmark_lists)->front();
+    landmark_count = pose.landmark_size();
+    if (landmark_count > kFlatPoseMaxLandmarks) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "Flat pose result holds ", kFlatPoseMaxLandmarks, " landmarks, got ",
+          landmark_count));
+    }
+    for (int i = 0; i < landmark_count; ++i) {
+      const mediapipe::NormalizedLandmark& landmark = pose.landmark(i);
+      float* slot = out + kFlatPoseLandmarksIndex + i * kFlatPoseLandmarkStride;
+      slot[0] = landmark.x();
+      slot[1] = landmark.y();
+      slot[2] = landmark.z();
+      slot[3] = landmark.has_visibility() ? landmark.visibility() : nan;
+      slot[4] = landmark.has_presence() ? landmark.presence() : nan;
+      if ((landmark.has_visibility() && std::isnan(landmark.visibility())) ||
+          (landmark.has_presence() && std::isnan(landmark.presence()))) {
+        // NaN also encodes an omitted field; tell the reader a NaN here came from the model.
+        flags |= kFlatPoseFlagSuppliedNaNConfidence;
+      }
+    }
+
+    // World and auxiliary vectors are indexed like the image landmarks; pose 0 only.
+    if (*world_lists != nullptr && !(*world_lists)->empty()) {
+      const mediapipe::LandmarkList& world = (*world_lists)->front();
+      world_count = world.landmark_size();
+      if (world_count > kFlatPoseMaxLandmarks) {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "Flat pose result holds ", kFlatPoseMaxLandmarks, " world landmarks, got ",
+            world_count));
+      }
+      for (int i = 0; i < world_count; ++i) {
+        const mediapipe::Landmark& landmark = world.landmark(i);
+        float* slot = out + kFlatPoseWorldIndex + i * kFlatPoseWorldStride;
+        slot[0] = landmark.x();
+        slot[1] = landmark.y();
+        slot[2] = landmark.z();
+      }
+    }
+    if (*auxiliary_lists != nullptr && !(*auxiliary_lists)->empty()) {
+      const mediapipe::NormalizedLandmarkList& auxiliary = (*auxiliary_lists)->front();
+      auxiliary_count = auxiliary.landmark_size();
+      if (auxiliary_count > kFlatPoseMaxAuxiliary) {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "Flat pose result holds ", kFlatPoseMaxAuxiliary,
+            " auxiliary landmarks, got ", auxiliary_count));
+      }
+      for (int i = 0; i < auxiliary_count; ++i) {
+        const mediapipe::NormalizedLandmark& landmark = auxiliary.landmark(i);
+        float* slot = out + kFlatPoseAuxiliaryIndex + i * kFlatPoseAuxiliaryStride;
+        slot[0] = landmark.x();
+        slot[1] = landmark.y();
+      }
+    }
+    if (*rects != nullptr && !(*rects)->empty()) {
+      const mediapipe::NormalizedRect& rect = (*rects)->front();
+      float* slot = out + kFlatPoseNativeRectIndex;
+      slot[0] = rect.x_center();
+      slot[1] = rect.y_center();
+      slot[2] = rect.width();
+      slot[3] = rect.height();
+      slot[4] = rect.rotation();
+      flags |= kFlatPoseFlagNativeRect;
+    }
+  }
+
+  out[kFlatPoseVersionIndex] = static_cast<float>(kFlatPoseLayoutVersion);
+  out[kFlatPoseFlagsIndex] = static_cast<float>(flags);
+  out[kFlatPoseLandmarkCountIndex] = static_cast<float>(landmark_count);
+  out[kFlatPoseWorldCountIndex] = static_cast<float>(world_count);
+  out[kFlatPoseAuxiliaryCountIndex] = static_cast<float>(auxiliary_count);
+  out[kFlatPosePoseCountIndex] = static_cast<float>(pose_count);
+  return pose_count > 0;
 }
 
 }  // namespace
@@ -642,6 +829,29 @@ JNIEXPORT void JNICALL PACKET_CREATOR_METHOD(nativeDestroyPreparedPoseSession)(
   // Called only after graph teardown released every packet that referenced a slot. GPU tensors
   // release their SSBOs through the GlContext they retain.
   delete PreparedPoseSessionFromHandle(handle);
+}
+
+JNIEXPORT jboolean JNICALL PACKET_CREATOR_METHOD(nativeWriteFlatPoseResult)(
+    JNIEnv* env, jclass clazz, jlong landmarks, jlong world_landmarks,
+    jlong auxiliary_landmarks, jlong pose_rects, jboolean pose_detector_ran,
+    jfloatArray out) {
+  if (out == nullptr || env->GetArrayLength(out) < kFlatPoseSize) {
+    ThrowIfError(env, absl::InvalidArgumentError(absl::StrCat(
+                          "Flat pose result needs ", kFlatPoseSize, " floats.")));
+    return JNI_FALSE;
+  }
+  // Stage on the stack (~1.1 KB) so protos are read without a JNI critical section and the
+  // Java array is written once, only after every stream validated.
+  float values[kFlatPoseSize];
+  const absl::StatusOr<bool> present = WriteFlatPoseResult(
+      landmarks, world_landmarks, auxiliary_landmarks, pose_rects,
+      pose_detector_ran == JNI_TRUE, values);
+  if (!present.ok()) {
+    ThrowIfError(env, present.status());
+    return JNI_FALSE;
+  }
+  env->SetFloatArrayRegion(out, 0, kFlatPoseSize, values);
+  return *present ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT jlong JNICALL PACKET_CREATOR_METHOD(nativeCreateReferencePacket)(

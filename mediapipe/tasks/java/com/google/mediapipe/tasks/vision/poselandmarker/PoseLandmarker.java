@@ -105,6 +105,79 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
   private static final int LANDMARKS_OUT_STREAM_INDEX = 0;
   private static final int WORLD_LANDMARKS_OUT_STREAM_INDEX = 1;
   private static final int OMITTED_OUT_STREAM_INDEX = -1;
+
+  /**
+   * Layout of the flat single-pose result (r25), in float words. Written by native code into an
+   * application-owned array armed with {@link #armFlatPoseResult(float[])}. Every slot without
+   * data is NaN; counts and flags are small integers stored exactly as floats.
+   *
+   * <p>Image landmarks are normalized to the graph input image (the 256x256 crop for prepared
+   * tensors). Auxiliary landmarks are the two tracking points MediaPipe turns into the next-frame
+   * rectangle (LandmarksToDetection, AlignmentPointsRects, RectTransformation); the native result
+   * of that operation is also carried so callers can verify their own construction.
+   */
+  public static final class FlatPoseResult {
+    /** Must equal the native writer's version word at {@link #VERSION_INDEX}. */
+    public static final float LAYOUT_VERSION = 1f;
+
+    public static final int VERSION_INDEX = 0;
+    /** Bit set of the FLAG_* values below. */
+    public static final int FLAGS_INDEX = 1;
+    public static final int LANDMARK_COUNT_INDEX = 2;
+    public static final int WORLD_COUNT_INDEX = 3;
+    public static final int AUXILIARY_COUNT_INDEX = 4;
+    /** Poses in the native output; only the first is written. */
+    public static final int POSE_COUNT_INDEX = 5;
+    /** x_center, y_center, width, height, rotation of MediaPipe's next-frame rectangle. */
+    public static final int NATIVE_RECT_INDEX = 6;
+    /** Per landmark: x, y, z, visibility, presence (NaN when the model omitted the field). */
+    public static final int LANDMARKS_INDEX = 11;
+    public static final int LANDMARK_STRIDE = 5;
+    public static final int MAX_LANDMARKS = 33;
+    /** Per landmark: x, y, z in meters. */
+    public static final int WORLD_INDEX = 176;
+    public static final int WORLD_STRIDE = 3;
+    /** Per auxiliary landmark: x, y normalized to the graph input image. */
+    public static final int AUXILIARY_INDEX = 275;
+    public static final int AUXILIARY_STRIDE = 2;
+    public static final int MAX_AUXILIARY = 2;
+    public static final int SIZE = 279;
+
+    public static final int FLAG_POSE_PRESENT = 1;
+    public static final int FLAG_POSE_DETECTOR_RAN = 2;
+    public static final int FLAG_NATIVE_RECT = 4;
+    /**
+     * A supplied visibility or presence was NaN. Without it, NaN means the model omitted the
+     * field; with it, callers must treat every NaN confidence as supplied (and invalid).
+     */
+    public static final int FLAG_SUPPLIED_NAN_CONFIDENCE = 8;
+
+    private FlatPoseResult() {}
+  }
+
+  /**
+   * Caller-confined flat output for one synchronous VIDEO call; see armFlatPoseResult. Created
+   * per landmarker (never static) so no static initializer is needed on the result path.
+   */
+  private static final class FlatResultTarget {
+    // Returned instead of a built result when the flat write succeeded. Empty and immutable; the
+    // caller learns which happened from disarmFlatPoseResult(), never from this object.
+    final PoseLandmarkerResult placeholder =
+        PoseLandmarkerResult.create(
+            Collections.emptyList(),
+            Collections.emptyList(),
+            Collections.emptyList(),
+            false,
+            Optional.empty(),
+            -1L);
+    // Written by the serialized caller before graph input and read on the graph output thread.
+    // Volatile because the Java memory model does not see the native idle barrier as an edge.
+    volatile float[] armed;
+    // Written on the graph output thread; read by the caller after the synchronous call.
+    volatile boolean written;
+    volatile RuntimeException failure;
+  }
+
   private static final String TASK_GRAPH_NAME =
       "mediapipe.tasks.vision.pose_landmarker.PoseLandmarkerGraph";
 
@@ -208,7 +281,9 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
             "USE_EXTERNAL_SOURCE_PROJECTION:"
                 + USE_EXTERNAL_SOURCE_PROJECTION_IN_STREAM_NAME);
       }
-      inputStreams.add("RESET_TRACKING:" + RESET_TRACKING_IN_STREAM_NAME);
+      if (!landmarkerOptions.statelessTracking().orElse(false)) {
+        inputStreams.add("RESET_TRACKING:" + RESET_TRACKING_IN_STREAM_NAME);
+      }
     }
     List<String> outputStreams = new ArrayList<>();
     outputStreams.add("NORM_LANDMARKS:pose_landmarks");
@@ -236,6 +311,12 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
     } else {
       segmentationMasksOutStreamIndex = OMITTED_OUT_STREAM_INDEX;
     }
+    // Object results also need the auxiliary landmarks for Android-owned next ROI.
+    // Append last to preserve the existing stream indices and flat-result ABI.
+    final FlatResultTarget flatTarget = landmarkerOptions.flatPoseResult().orElse(false)
+        ? new FlatResultTarget() : null;
+    final int auxiliaryLandmarksOutStreamIndex = outputStreams.size();
+    outputStreams.add("AUXILIARY_LANDMARKS:auxiliary_landmarks");
 
     // TODO: Consolidate OutputHandler and TaskRunner.
     OutputHandler<PoseLandmarkerResult, MPImage> handler = new OutputHandler<>();
@@ -243,6 +324,36 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
         new OutputHandler.OutputPacketConverter<PoseLandmarkerResult, MPImage>() {
           @Override
           public PoseLandmarkerResult convertToTaskResult(List<Packet> packets) {
+            if (flatTarget != null) {
+              float[] flat = flatTarget.armed;
+              if (flat != null) {
+                try {
+                  com.google.mediapipe.framework.PacketCreator.writeFlatPoseResult(
+                      packets.get(LANDMARKS_OUT_STREAM_INDEX),
+                      packets.get(WORLD_LANDMARKS_OUT_STREAM_INDEX),
+                      packets.get(auxiliaryLandmarksOutStreamIndex),
+                      packets.get(poseRectsNextFrameOutStreamIndex),
+                      !packets.get(poseDetectionsOutStreamIndex).isEmpty(),
+                      flat);
+                  if (flat[FlatPoseResult.VERSION_INDEX] != FlatPoseResult.LAYOUT_VERSION) {
+                    throw new IllegalStateException(
+                        "Flat pose result layout mismatch: native="
+                            + flat[FlatPoseResult.VERSION_INDEX]
+                            + " java="
+                            + FlatPoseResult.LAYOUT_VERSION
+                            + ". Rebuild the core and vision AARs together.");
+                  }
+                  flatTarget.written = true;
+                  return flatTarget.placeholder;
+                } catch (RuntimeException failure) {
+                  // Backup plan: this frame is still delivered, as objects built below. The
+                  // caller reads the cause from takeFlatPoseResultFailure() and decides whether
+                  // to keep using the flat route. Never rethrown here: OutputHandler only caches
+                  // MediaPipeException, and the graph thread must not see an app error.
+                  flatTarget.failure = failure;
+                }
+              }
+            }
             // If there is no poses detected in the image, just returns empty lists.
             if (packets.get(LANDMARKS_OUT_STREAM_INDEX).isEmpty()) {
               return PoseLandmarkerResult.create(
@@ -272,6 +383,10 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
                         RectProto.NormalizedRect.parser()),
                 !packets.get(poseDetectionsOutStreamIndex).isEmpty(),
                 segmentedMasks,
+                packets.get(auxiliaryLandmarksOutStreamIndex).isEmpty()
+                    ? Collections.emptyList()
+                    : PacketGetter.getProtoVector(packets.get(auxiliaryLandmarksOutStreamIndex),
+                        NormalizedLandmarkList.parser()),
                 BaseVisionTaskApi.generateResultTimestampMs(
                     landmarkerOptions.runningMode(), packets.get(LANDMARKS_OUT_STREAM_INDEX)));
           }
@@ -295,7 +410,9 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
             TaskInfo.<PoseLandmarkerOptions>builder()
                 .setTaskName(PoseLandmarker.class.getSimpleName())
                 .setTaskRunningModeName(landmarkerOptions.runningMode().name())
-                .setTaskGraphName(TASK_GRAPH_NAME)
+                .setTaskGraphName(landmarkerOptions.statelessTracking().orElse(false)
+                    ? "mediapipe.tasks.vision.pose_landmarker.StatelessPoseLandmarkerGraph"
+                    : TASK_GRAPH_NAME)
                 .setInputStreams(inputStreams)
                 .setOutputStreams(outputStreams)
                 .setTaskOptions(landmarkerOptions)
@@ -307,7 +424,8 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
         landmarkerOptions.borrowedImageInput().orElse(false),
         landmarkerOptions.appTensorInput().orElse(false),
         landmarkerOptions.runningMode() == RunningMode.VIDEO
-            && landmarkerOptions.nativeSourceProjection().orElse(true));
+            && landmarkerOptions.nativeSourceProjection().orElse(true),
+        flatTarget, landmarkerOptions.statelessTracking().orElse(false));
   }
 
   @SuppressWarnings("ConstantCaseForConstants")
@@ -324,6 +442,9 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
   private final boolean appTensorInput;
   // True when the VIDEO graph connects the external source projection input trio.
   private final boolean nativeSourceProjection;
+  private final boolean statelessTracking;
+
+  public boolean isStatelessTracking() { return statelessTracking; }
   // Confined to the synchronous VIDEO caller; close follows the caller's inference drain.
   private Packet tensorImage;
   private Packet emptyTensorVector;
@@ -333,13 +454,70 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
   // Sessions opened on this landmarker. Graph packets may reference their slots until graph
   // teardown, so close() frees them only after the native graph is released.
   private final List<PreparedPoseSession> preparedSessions = new ArrayList<>();
+  // Non-null only when constructed with setFlatPoseResult(true).
+  private final FlatResultTarget flatTarget;
 
   private PoseLandmarker(TaskRunner taskRunner, RunningMode runningMode, boolean borrowedImageInput,
-      boolean appTensorInput, boolean nativeSourceProjection) {
+      boolean appTensorInput, boolean nativeSourceProjection, FlatResultTarget flatTarget, boolean statelessTracking) {
     super(taskRunner, runningMode, IMAGE_IN_STREAM_NAME, NORM_RECT_IN_STREAM_NAME);
     this.borrowedImageInput = borrowedImageInput;
     this.appTensorInput = appTensorInput;
     this.nativeSourceProjection = nativeSourceProjection;
+    this.flatTarget = flatTarget;
+    this.statelessTracking = statelessTracking;
+  }
+
+  /**
+   * Directs the result of the next synchronous VIDEO call on this landmarker into {@code target},
+   * laid out as {@link FlatPoseResult}. Applies to every VIDEO entry point (image, texture, app
+   * tensor and {@link PreparedPoseSession}), so one result representation serves tracking and
+   * acquisition alike.
+   *
+   * <p>Pair every arm with {@link #disarmFlatPoseResult()} in a finally block. While armed, a
+   * successful flat write makes the detect method return an empty placeholder that must be
+   * ignored. If the native write fails, that call still returns an ordinary {@link
+   * PoseLandmarkerResult}, and {@link #takeFlatPoseResultFailure()} reports why. Same serialized
+   * owner contract as detectForVideo; the array must not be read or reused until disarmed.
+   *
+   * @throws IllegalStateException if flat results were not enabled at construction, or a
+   *     previous arm was never disarmed (a missing finally would otherwise redirect a later
+   *     caller's result into a stale array).
+   */
+  public void armFlatPoseResult(float[] target) {
+    if (flatTarget == null) {
+      throw new IllegalStateException("Enable flat pose results at construction.");
+    }
+    if (target == null || target.length < FlatPoseResult.SIZE) {
+      throw new IllegalArgumentException(
+          "Flat pose result needs " + FlatPoseResult.SIZE + " floats.");
+    }
+    if (flatTarget.armed != null) {
+      throw new IllegalStateException("A flat pose result is already armed; disarm it first.");
+    }
+    flatTarget.written = false;
+    flatTarget.failure = null;
+    flatTarget.armed = target;
+  }
+
+  /**
+   * Ends the armed call. Returns true when its result was written into the armed array; false
+   * when the call returned an ordinary result (no synchronized output, or the flat write failed:
+   * see {@link #takeFlatPoseResultFailure()}). Idempotent; never throws.
+   */
+  public boolean disarmFlatPoseResult() {
+    if (flatTarget == null) return false;
+    flatTarget.armed = null;
+    boolean written = flatTarget.written;
+    flatTarget.written = false;
+    return written;
+  }
+
+  /** Returns and clears the native flat-write failure of the last armed call, or null. */
+  public RuntimeException takeFlatPoseResultFailure() {
+    if (flatTarget == null) return null;
+    RuntimeException failure = flatTarget.failure;
+    flatTarget.failure = null;
+    return failure;
   }
 
   /**
@@ -508,9 +686,18 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
      * points share one reset contract. GPU storage must be called with the writing context
      * current; native code fences that write without a CPU wait.
      */
+    public PoseLandmarkerResult detect(int slot, long timestampMs) {
+      return detect(slot, timestampMs, false);
+    }
+
     public PoseLandmarkerResult detect(int slot, long timestampMs, boolean resetTracking) {
+      if (owner.statelessTracking && resetTracking) {
+        abandonSlot(slot);
+        throw new IllegalStateException("Stateless pose session cannot reset tracking.");
+      }
       long session = requireOpen();
-      boolean reset = owner.resetTrackingPending.getAndSet(false) || resetTracking;
+      boolean reset = !owner.statelessTracking &&
+          (owner.resetTrackingPending.getAndSet(false) || resetTracking);
       pendingSlot = slot;
       pendingReset = reset;
       submitAttempted = false;
@@ -590,7 +777,7 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
     long handle = 0;
     try {
       streams.add(EXTERNAL_TENSORS_IN_STREAM_NAME);
-      streams.add(RESET_TRACKING_IN_STREAM_NAME);
+      streams.add(statelessTracking ? "" : RESET_TRACKING_IN_STREAM_NAME);
       streams.add(IMAGE_IN_STREAM_NAME);
       metadata.add(creator.createPoseTensorImage());
       streams.add(NORM_RECT_IN_STREAM_NAME);
@@ -743,6 +930,9 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
    * @throws MediaPipeException if this task is not in video mode.
    */
   public void resetTracking() {
+    if (statelessTracking) {
+      throw new IllegalStateException("Stateless pose landmarker cannot reset tracking.");
+    }
     if (runningMode != RunningMode.VIDEO) {
       throw new MediaPipeException(
           MediaPipeException.StatusCode.FAILED_PRECONDITION.ordinal(),
@@ -1121,9 +1311,10 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
         throw new IllegalStateException(
             "Native source projection was disabled when this landmarker was created.");
       }
-      inputPackets.put(
-          RESET_TRACKING_IN_STREAM_NAME,
-          runner.getPacketCreator().createBool(resetTrackingPending.getAndSet(false)));
+      if (!statelessTracking) {
+        inputPackets.put(RESET_TRACKING_IN_STREAM_NAME,
+            runner.getPacketCreator().createBool(resetTrackingPending.getAndSet(false)));
+      }
       PoseLandmarkerResult result =
           (PoseLandmarkerResult) super.processVideoData(inputPackets, timestampMs);
       if (result == null) {
@@ -1277,6 +1468,15 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
        * then throw, and every frame omits three placeholder packets and their routing nodes.
        */
       public abstract Builder setNativeSourceProjection(Boolean value);
+      /**
+       * Single-pose VIDEO opt-in (r25): adds the auxiliary tracking-landmark output and lets
+       * {@link PoseLandmarker#armFlatPoseResult(float[])} receive results as a flat float array
+       * instead of protobuf-derived Java objects. Unarmed calls keep the object result.
+       */
+      public abstract Builder setFlatPoseResult(Boolean value);
+
+      /** Input-driven single-pose VIDEO graph with no temporal smoothing or loopback. */
+      public abstract Builder setStatelessTracking(Boolean value);
 
       public abstract Builder setOutputSegmentationMasks(boolean value);
 
@@ -1301,6 +1501,11 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
        */
       public final PoseLandmarkerOptions build() {
         PoseLandmarkerOptions options = autoBuild();
+        if (options.statelessTracking().orElse(false) &&
+            (options.runningMode() != RunningMode.VIDEO || options.numPoses().orElse(1) != 1 ||
+             options.outputSegmentationMasks())) {
+          throw new IllegalArgumentException("Stateless tracking requires single-pose VIDEO without masks.");
+        }
         if (options.appTensorInput().orElse(false) &&
             (options.runningMode() != RunningMode.VIDEO || options.numPoses().orElse(1) != 1 ||
              options.outputSegmentationMasks())) {
@@ -1309,6 +1514,13 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
         }
         if (options.borrowedImageInput().orElse(false) && options.runningMode() != RunningMode.VIDEO) {
           throw new IllegalArgumentException("Borrowed image input requires synchronous VIDEO mode.");
+        }
+        if (options.flatPoseResult().orElse(false) &&
+            (options.runningMode() != RunningMode.VIDEO || options.numPoses().orElse(1) != 1 ||
+             options.outputSegmentationMasks())) {
+          // The layout holds exactly one pose and no masks; a silent truncation would be a bug.
+          throw new IllegalArgumentException(
+              "Flat pose results require single-pose VIDEO mode without segmentation masks.");
         }
         if (options.runningMode() == RunningMode.LIVE_STREAM) {
           if (!options.resultListener().isPresent()) {
@@ -1343,6 +1555,8 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
     abstract Optional<Boolean> borrowedImageInput();
     abstract Optional<Boolean> appTensorInput();
     abstract Optional<Boolean> nativeSourceProjection();
+    abstract Optional<Boolean> flatPoseResult();
+    public abstract Optional<Boolean> statelessTracking();
 
     @Override
     public void configureGraph(com.google.mediapipe.proto.CalculatorProto.CalculatorGraphConfig.Builder graph) {

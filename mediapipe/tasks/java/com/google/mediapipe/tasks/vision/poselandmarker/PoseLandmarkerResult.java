@@ -49,6 +49,18 @@ public abstract class PoseLandmarkerResult implements TaskResult {
       boolean poseDetectorRan,
       Optional<List<MPImage>> segmentationMasksData,
       long timestampMs) {
+    return create(landmarksProto, worldLandmarksProto, poseRectsNextFrameProto,
+        poseDetectorRan, segmentationMasksData, Collections.emptyList(), timestampMs);
+  }
+
+  static PoseLandmarkerResult create(
+      List<LandmarkProto.NormalizedLandmarkList> landmarksProto,
+      List<LandmarkProto.LandmarkList> worldLandmarksProto,
+      List<com.google.mediapipe.formats.proto.RectProto.NormalizedRect> poseRectsNextFrameProto,
+      boolean poseDetectorRan,
+      Optional<List<MPImage>> segmentationMasksData,
+      List<LandmarkProto.NormalizedLandmarkList> auxiliaryLandmarksProto,
+      long timestampMs) {
 
     Optional<List<MPImage>> multiPoseSegmentationMasks = Optional.empty();
     if (segmentationMasksData.isPresent()) {
@@ -75,12 +87,19 @@ public abstract class PoseLandmarkerResult implements TaskResult {
       poseRectsNextFrame.add(NormalizedRect.createFromProto(rectProto));
     }
 
+    List<List<NormalizedLandmark>> auxiliaryLandmarks = new ArrayList<>();
+    for (LandmarkProto.NormalizedLandmarkList auxiliaryProto : auxiliaryLandmarksProto) {
+      auxiliaryLandmarks.add(Collections.unmodifiableList(
+          NormalizedLandmark.createListFromProto(auxiliaryProto)));
+    }
+
     return new AutoValue_PoseLandmarkerResult(
         timestampMs,
         Collections.unmodifiableList(multiPoseLandmarks),
         Collections.unmodifiableList(multiPoseWorldLandmarks),
         Collections.unmodifiableList(poseRectsNextFrame),
         poseDetectorRan,
+        Collections.unmodifiableList(auxiliaryLandmarks),
         multiPoseSegmentationMasks);
   }
 
@@ -124,6 +143,9 @@ public abstract class PoseLandmarkerResult implements TaskResult {
    * whether landmarks were present.
    */
   public abstract boolean poseDetectorRan();
+
+  /** Auxiliary alignment landmarks in the same normalized image space as landmarks(). */
+  public abstract List<List<NormalizedLandmark>> auxiliaryLandmarks();
 
   /** Pose segmentation masks. */
   public abstract Optional<List<MPImage>> segmentationMasks();

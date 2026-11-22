@@ -256,9 +256,18 @@ absl::Status SetSubTaskBaseOptions(const ModelAssetBundleResources& resources,
 // }
 class PoseLandmarkerGraph : public core::ModelTaskGraph {
  public:
+  virtual bool IsStateless() const { return false; }
   absl::StatusOr<CalculatorGraphConfig> GetConfig(
       SubgraphContext* sc) override {
     Graph graph;
+    const bool stateless = IsStateless();
+    if (stateless && (HasInput(sc->OriginalNode(), kResetTrackingTag) ||
+        !HasInput(sc->OriginalNode(), kExternalPoseRectTag) ||
+        !sc->Options<PoseLandmarkerGraphOptions>().base_options().use_stream_mode() ||
+        sc->Options<PoseLandmarkerGraphOptions>().pose_detector_graph_options().num_poses() != 1 ||
+        HasOutput(sc->OriginalNode(), kSegmentationMaskTag))) {
+      return absl::InvalidArgumentError("Stateless pose requires single-pose stream mode, external ROI inputs, no reset and no masks.");
+    }
     bool output_segmentation_masks =
         HasOutput(sc->OriginalNode(), kSegmentationMaskTag);
     const bool output_image = HasOutput(sc->OriginalNode(), kImageTag);
@@ -334,15 +343,16 @@ class PoseLandmarkerGraph : public core::ModelTaskGraph {
       reset_tracking_in = graph.In(kResetTrackingTag).Cast<bool>();
     }
     if (output_video_sync) {
-      if (!reset_tracking_in) {
+      auto sync_in = stateless ? use_external_pose_rect_in : reset_tracking_in;
+      if (!sync_in) {
         return absl::InvalidArgumentError(
-            "VIDEO_SYNC requires the per-frame RESET_TRACKING input.");
+            "VIDEO_SYNC requires the per-frame routing or reset input.");
       }
       // Keep separate internal names for the input and output. Subgraph expansion
       // maps them to different parent streams; aliasing one stream at both ports
-      // would rename the reset gate's input to the unproduced VIDEO_SYNC output.
+      // would rename the routing input to the unproduced VIDEO_SYNC output.
       auto& video_sync = graph.AddNode("PassThroughCalculator");
-      *reset_tracking_in >> video_sync.In("");
+      *sync_in >> video_sync.In("");
       video_sync.Out("").Cast<bool>() >> graph[Output<bool>(kVideoSyncTag)];
     }
     ABSL_ASSIGN_OR_RETURN(
@@ -355,7 +365,7 @@ class PoseLandmarkerGraph : public core::ModelTaskGraph {
                        external_source_image_size_in,
                        use_external_source_projection_in,
                        reset_tracking_in, external_tensors_in, graph, output_segmentation_masks,
-                       output_image));
+                       output_image, stateless));
     outs.landmark_lists >>
         graph[Output<std::vector<NormalizedLandmarkList>>(kNormLandmarksTag)];
     outs.world_landmark_lists >>
@@ -398,7 +408,7 @@ class PoseLandmarkerGraph : public core::ModelTaskGraph {
       std::optional<Source<bool>> use_external_source_projection_in,
       std::optional<Source<bool>> reset_tracking_in,
       std::optional<Source<std::vector<Tensor>>> external_tensors_in, Graph& graph,
-      bool output_segmentation_masks, bool output_image) {
+      bool output_segmentation_masks, bool output_image, bool stateless) {
     const int max_num_poses =
         tasks_options.pose_detector_graph_options().num_poses();
 
@@ -422,6 +432,10 @@ class PoseLandmarkerGraph : public core::ModelTaskGraph {
             .GetOptions<PoseLandmarksDetectorGraphOptions>();
     pose_landmarks_detector_graph_options.Swap(
         tasks_options.mutable_pose_landmarks_detector_graph_options());
+
+    if (stateless) {
+      pose_landmarks_detector_graph_options.set_smooth_landmarks(false);
+    }
 
     // Apply smoothing filter only on the single pose landmarks, because
     // landmarks smoothing calculator doesn't support multiple landmarks yet.
@@ -472,7 +486,18 @@ class PoseLandmarkerGraph : public core::ModelTaskGraph {
               .Cast<std::vector<Image>>();
     }
 
-    if (tasks_options.base_options().use_stream_mode()) {
+    if (stateless) {
+      DisallowIf(image_in, *use_external_pose_rect_in, graph) >> pose_detector.In(kImageTag);
+      DisallowIf(norm_rect_in, *use_external_pose_rect_in, graph) >> pose_detector.In(kNormRectTag);
+      auto& vectorize = graph.AddNode("ConcatenateNormalizedRectVectorCalculator");
+      *external_pose_rect_in >> vectorize.In("");
+      auto external_rects = AllowIf(
+          vectorize.Out("").Cast<std::vector<NormalizedRect>>(),
+          *use_external_pose_rect_in, graph);
+      Merge(external_rects,
+            pose_detector.Out(kExpandedPoseRectsTag).Cast<std::vector<NormalizedRect>>(),
+            graph) >> clip_pose_rects.In("");
+    } else if (tasks_options.base_options().use_stream_mode()) {
       auto& previous_loopback = graph.AddNode("PreviousLoopbackCalculator");
       image_in >> previous_loopback.In(kMainTag);
       auto prev_pose_rects_from_landmarks =
@@ -572,6 +597,13 @@ class PoseLandmarkerGraph : public core::ModelTaskGraph {
     }};
   }
 };
+
+class StatelessPoseLandmarkerGraph : public PoseLandmarkerGraph {
+ public:
+  bool IsStateless() const override { return true; }
+};
+REGISTER_MEDIAPIPE_GRAPH(
+    ::mediapipe::tasks::vision::pose_landmarker::StatelessPoseLandmarkerGraph);
 
 REGISTER_MEDIAPIPE_GRAPH(
     ::mediapipe::tasks::vision::pose_landmarker::PoseLandmarkerGraph);

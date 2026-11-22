@@ -145,6 +145,36 @@ public class PacketCreator {
     nativeDestroyPreparedPoseSession(session);
   }
 
+  /**
+   * Writes the first pose of a pose landmarker output into an application-owned array (r25),
+   * without serializing protos or building Java objects. The layout belongs to {@code
+   * PoseLandmarker.FlatPoseResult}; native code writes its version word first, so a mismatched
+   * core/vision pair is detectable. A null packet is an absent stream; an empty packet is a
+   * timestamp without that output. The array is written only after every stream validated.
+   *
+   * <p>Lives on PacketCreator, not PacketGetter, because the custom core AAR overlays only this
+   * framework class from the fork; every other framework class is the stock 0.10.29 build.
+   *
+   * @return true when the graph produced a pose.
+   * @throws MediaPipeException for an unexpected stream type, a pose larger than the layout, or an
+   *     undersized array; {@code out} is then left unchanged.
+   */
+  public static boolean writeFlatPoseResult(
+      Packet landmarks,
+      Packet worldLandmarks,
+      Packet auxiliaryLandmarks,
+      Packet poseRects,
+      boolean poseDetectorRan,
+      float[] out) {
+    return nativeWriteFlatPoseResult(
+        landmarks == null ? 0 : landmarks.getNativeHandle(),
+        worldLandmarks == null ? 0 : worldLandmarks.getNativeHandle(),
+        auxiliaryLandmarks == null ? 0 : auxiliaryLandmarks.getNativeHandle(),
+        poseRects == null ? 0 : poseRects.getNativeHandle(),
+        poseDetectorRan,
+        out);
+  }
+
   private native long nativeCreatePoseTensor(long context, boolean allocate);
   private native ByteBuffer nativeGetCpuPoseTensorBuffer(long packet);
   private native long nativeCreatePoseTensorFromGlBuffer(long context, int buffer);
@@ -158,6 +188,13 @@ public class PacketCreator {
   private native void nativeSubmitPreparedPoseFrame(
       long context, long session, int slot, long timestamp, boolean resetTracking);
   private native void nativeDestroyPreparedPoseSession(long session);
+  private static native boolean nativeWriteFlatPoseResult(
+      long landmarks,
+      long worldLandmarks,
+      long auxiliaryLandmarks,
+      long poseRects,
+      boolean poseDetectorRan,
+      float[] out);
 
   /**
    * Create a MediaPipe Packet that contains a pointer to another MediaPipe packet.

@@ -51,6 +51,14 @@ JNIEXPORT void JNICALL PACKET_CREATOR_METHOD(nativeSubmitPreparedPoseFrame)(
 JNIEXPORT void JNICALL PACKET_CREATOR_METHOD(nativeDestroyPreparedPoseSession)(
     JNIEnv* env, jobject thiz, jlong session);
 
+// Flat single-pose result (r25): static. Writes the first pose of a PoseLandmarkerGraph output
+// into an app-owned float[] laid out as PoseLandmarker.FlatPoseResult. A zero handle is an absent
+// stream. Returns whether a pose was present. See packet_creator_jni.cc for the layout.
+JNIEXPORT jboolean JNICALL PACKET_CREATOR_METHOD(nativeWriteFlatPoseResult)(
+    JNIEnv* env, jclass clazz, jlong landmarks, jlong world_landmarks,
+    jlong auxiliary_landmarks, jlong pose_rects, jboolean pose_detector_ran,
+    jfloatArray out);
+
 JNIEXPORT jlong JNICALL PACKET_CREATOR_METHOD(nativeCreateReferencePacket)(
     JNIEnv* env, jobject thiz, jlong context, jlong packet);
 

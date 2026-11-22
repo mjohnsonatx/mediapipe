@@ -99,7 +99,10 @@ cc_library(
         "//mediapipe/framework/formats:image",
         "//mediapipe/framework/formats:image_format_cc_proto",
         "//mediapipe/framework/formats:image_frame",
+        # r25 flat pose result reads landmark/rect vectors without proto serialization.
+        "//mediapipe/framework/formats:landmark_cc_proto",
         "//mediapipe/framework/formats:matrix",
+        "//mediapipe/framework/formats:rect_cc_proto",
         "//mediapipe/framework/formats:tensor",
         "//mediapipe/framework/formats:time_series_header_cc_proto",
         "//mediapipe/framework/formats:video_stream_header",
