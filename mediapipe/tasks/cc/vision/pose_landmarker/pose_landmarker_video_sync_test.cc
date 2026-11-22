@@ -14,6 +14,7 @@
 
 // Run with POSE_LANDMARKER_TEST_MODEL pointing to a pose landmarker .task bundle.
 // This also runs as an Android native executable against the app's model assets.
+#include <algorithm>
 #include <cstdlib>
 #include <map>
 #include <memory>
@@ -27,6 +28,7 @@
 #include "mediapipe/framework/formats/image_format.pb.h"
 #include "mediapipe/framework/formats/image_frame.h"
 #include "mediapipe/framework/formats/rect.pb.h"
+#include "mediapipe/framework/formats/tensor.h"
 #include "mediapipe/framework/port/gtest.h"
 #include "mediapipe/framework/port/status_matchers.h"
 #include "mediapipe/framework/tool/sink.h"
@@ -36,7 +38,8 @@ namespace mediapipe::tasks::vision::pose_landmarker {
 namespace {
 
 CalculatorGraphConfig MakeConfig(bool stream_mode, bool video_sync,
-                                 bool reset_tracking, bool segmentation) {
+                                 bool reset_tracking, bool segmentation,
+                                 bool app_tensors = false) {
   api2::builder::Graph graph;
   auto& pose = graph.AddNode(
       "mediapipe.tasks.vision.pose_landmarker.PoseLandmarkerGraph");
@@ -50,6 +53,9 @@ CalculatorGraphConfig MakeConfig(bool stream_mode, bool video_sync,
       false);
   graph.In("IMAGE").SetName("image_in") >> pose.In("IMAGE");
   graph.In("NORM_RECT").SetName("norm_rect_in") >> pose.In("NORM_RECT");
+  if (app_tensors) {
+    graph.In("EXTERNAL_TENSORS").SetName("external_tensors_in") >> pose.In("EXTERNAL_TENSORS");
+  }
   if (video_sync) {
     graph.In("EXTERNAL_POSE_RECT").SetName("external_pose_rect_in") >>
         pose.In("EXTERNAL_POSE_RECT");
@@ -166,6 +172,53 @@ TEST_P(PoseLandmarkerVideoSyncTest, StartsAndReturnsEmptyFramesWithoutImage) {
 
 INSTANTIATE_TEST_SUITE_P(Segmentation, PoseLandmarkerVideoSyncTest,
                          testing::Bool());
+
+TEST(PoseLandmarkerTensorSyncTest, BlankAcquisitionPreparedAndReacquisitionAllComplete) {
+  auto config = MakeConfig(true, true, true, false, /*app_tensors=*/true);
+  std::vector<std::vector<Packet>> results;
+  std::map<std::string, Packet> side_packets;
+  tool::AddMultiStreamCallback(
+      {"pose_landmarks", "video_sync", "pose_detections"},
+      [&results](const std::vector<Packet>& packets) { results.push_back(packets); },
+      &config, &side_packets, /*observe_timestamp_bounds=*/false);
+  CalculatorGraph graph;
+  MP_ASSERT_OK(graph.Initialize(config));
+  MP_ASSERT_OK(graph.StartRun(side_packets));
+  for (int i = 0; i < 5; ++i) {
+    const Timestamp timestamp(i * 33333);
+    const bool prepared = i % 2 == 1;
+    std::vector<Tensor> tensors;
+    if (prepared) {
+      tensors.emplace_back(Tensor::ElementType::kFloat32, Tensor::Shape{1, 256, 256, 3});
+      auto view = tensors.front().GetCpuWriteView();
+      std::fill_n(view.buffer<float>(), 256 * 256 * 3, 0.0f);
+    }
+    MP_ASSERT_OK(graph.AddPacketToInputStream("external_tensors_in",
+        MakePacket<std::vector<Tensor>>(std::move(tensors)).At(timestamp)));
+    MP_ASSERT_OK(graph.AddPacketToInputStream("image_in",
+        MakePacket<Image>(MakeBlankImage()).At(timestamp)));
+    for (const auto* stream : {"norm_rect_in", "external_pose_rect_in", "projection_in"}) {
+      MP_ASSERT_OK(graph.AddPacketToInputStream(stream,
+          MakePacket<NormalizedRect>(FullImageRect()).At(timestamp)));
+    }
+    MP_ASSERT_OK(graph.AddPacketToInputStream("source_size_in",
+        MakePacket<std::pair<int, int>>(256, 256).At(timestamp)));
+    MP_ASSERT_OK(graph.AddPacketToInputStream("use_external_pose_rect_in",
+        MakePacket<bool>(prepared).At(timestamp)));
+    MP_ASSERT_OK(graph.AddPacketToInputStream("use_projection_in",
+        MakePacket<bool>(false).At(timestamp)));
+    MP_ASSERT_OK(graph.AddPacketToInputStream("reset_tracking_in",
+        MakePacket<bool>(!prepared).At(timestamp)));
+    MP_ASSERT_OK(graph.WaitUntilIdle());
+    ASSERT_EQ(results.size(), i + 1);
+    EXPECT_TRUE(results.back()[0].IsEmpty());
+    ASSERT_FALSE(results.back()[1].IsEmpty());
+    EXPECT_EQ(results.back()[1].Timestamp(), timestamp);
+    if (prepared) EXPECT_TRUE(results.back()[2].IsEmpty());
+  }
+  MP_ASSERT_OK(graph.CloseAllInputStreams());
+  MP_ASSERT_OK(graph.WaitUntilDone());
+}
 
 class PoseLandmarkerImageOutputTest : public testing::TestWithParam<bool> {};
 

@@ -24,6 +24,15 @@ extern "C" {
 #define PACKET_CREATOR_METHOD(METHOD_NAME) \
   Java_com_google_mediapipe_framework_PacketCreator_##METHOD_NAME
 
+JNIEXPORT jlong JNICALL PACKET_CREATOR_METHOD(nativeCreatePoseTensor)(
+    JNIEnv* env, jobject thiz, jlong context, jboolean allocate);
+JNIEXPORT jobject JNICALL PACKET_CREATOR_METHOD(nativeGetCpuPoseTensorBuffer)(
+    JNIEnv* env, jobject thiz, jlong packet);
+JNIEXPORT jlong JNICALL PACKET_CREATOR_METHOD(nativeCreatePoseTensorFromGlBuffer)(
+    JNIEnv* env, jobject thiz, jlong context, jint buffer);
+JNIEXPORT jlong JNICALL PACKET_CREATOR_METHOD(nativeCreatePoseTensorImage)(
+    JNIEnv* env, jobject thiz, jlong context);
+
 JNIEXPORT jlong JNICALL PACKET_CREATOR_METHOD(nativeCreateReferencePacket)(
     JNIEnv* env, jobject thiz, jlong context, jlong packet);
 

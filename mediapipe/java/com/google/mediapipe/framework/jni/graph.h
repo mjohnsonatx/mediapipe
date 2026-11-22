@@ -39,6 +39,7 @@
 #include "mediapipe/framework/calculator_framework.h"
 
 namespace mediapipe {
+class MemoryManager;
 namespace android {
 
 namespace internal {
@@ -126,6 +127,8 @@ class Graph {
   // Puts a mediapipe packet into the context for management.
   // Returns the handle to the internal PacketWithContext object.
   int64_t WrapPacketIntoContext(const Packet& packet);
+  // Immutable service lookup after task startup; caller must hold the graph's live ownership.
+  mediapipe::MemoryManager* GetMemoryManager() const;
 #if !MEDIAPIPE_DISABLE_GPU
   // Gets the shared mediapipe::GpuResources. Only valid once the graph is
   // running.

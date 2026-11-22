@@ -173,6 +173,12 @@ int64_t Graph::WrapPacketIntoContext(const Packet& packet) {
   return reinterpret_cast<int64_t>(packet_context);
 }
 
+mediapipe::MemoryManager* Graph::GetMemoryManager() const {
+  auto found = service_packets_.find(&kMemoryManagerService);
+  if (found == service_packets_.end()) return nullptr;
+  return found->second.Get<std::shared_ptr<MemoryManager>>().get();
+}
+
 // static
 Packet Graph::GetPacketFromHandle(int64_t packet_handle) {
   internal::PacketWithContext* packet_with_context =

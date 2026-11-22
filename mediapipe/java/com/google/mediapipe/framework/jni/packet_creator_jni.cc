@@ -23,6 +23,7 @@
 #include <string>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 #include "absl/cleanup/cleanup.h"
 #include "absl/status/status.h"
@@ -33,6 +34,7 @@
 #include "mediapipe/framework/formats/image_format.pb.h"
 #include "mediapipe/framework/formats/image_frame.h"
 #include "mediapipe/framework/formats/matrix.h"
+#include "mediapipe/framework/formats/tensor.h"
 #include "mediapipe/framework/formats/time_series_header.pb.h"
 #include "mediapipe/framework/formats/video_stream_header.h"
 #include "mediapipe/framework/packet.h"
@@ -50,6 +52,7 @@
 #include "mediapipe/gpu/gl_texture_buffer.h"
 #include "mediapipe/gpu/gpu_buffer.h"
 #include "mediapipe/gpu/gpu_buffer_format.h"
+#include "mediapipe/gpu/gpu_shared_data_internal.h"
 #endif  // !MEDIAPIPE_DISABLE_GPU
 
 namespace {
@@ -196,6 +199,119 @@ CreateImageFrameFromByteBuffer(JNIEnv* env, jobject byte_buffer, jint width,
 }
 
 }  // namespace
+
+JNIEXPORT jlong JNICALL PACKET_CREATOR_METHOD(nativeCreatePoseTensor)(
+    JNIEnv* env, jobject, jlong context, jboolean allocate) {
+  std::vector<mediapipe::Tensor> tensors;
+  if (allocate) {
+    tensors.emplace_back(mediapipe::Tensor::ElementType::kFloat32,
+                         mediapipe::Tensor::Shape{1, 256, 256, 3},
+                         reinterpret_cast<mediapipe::android::Graph*>(context)->GetMemoryManager(),
+                         /*memory_alignment=*/64);
+  }
+  return CreatePacketWithContext(context,
+      mediapipe::MakePacket<std::vector<mediapipe::Tensor>>(std::move(tensors)));
+}
+
+JNIEXPORT jobject JNICALL PACKET_CREATOR_METHOD(nativeGetCpuPoseTensorBuffer)(
+    JNIEnv* env, jobject, jlong packet_handle) {
+  const auto& packet = mediapipe::android::Graph::GetPacketFromHandle(packet_handle);
+  auto status = packet.ValidateAsType<std::vector<mediapipe::Tensor>>();
+  if (!status.ok()) { ThrowIfError(env, status); return nullptr; }
+  const auto& tensors = packet.Get<std::vector<mediapipe::Tensor>>();
+  if (tensors.size() != 1) {
+    ThrowIfError(env, absl::InvalidArgumentError("Expected one pose tensor."));
+    return nullptr;
+  }
+  const auto& dims = tensors[0].shape().dims;
+  if (tensors[0].element_type() != mediapipe::Tensor::ElementType::kFloat32 ||
+      dims.size() != 4 || dims[0] != 1 || dims[1] != 256 || dims[2] != 256 || dims[3] != 3 ||
+      tensors[0].ready_on_cpu() || tensors[0].ready_on_gpu()) {
+    ThrowIfError(env, absl::InvalidArgumentError("CPU pose tensor write view can be requested only once."));
+    return nullptr;
+  }
+  // Exclusive pre-submission ownership permits Java to fill this allocation after the view
+  // unlocks. The packet retains it through native inference; Java must not mutate after submit.
+  auto view = tensors[0].GetCpuWriteView();
+  return env->NewDirectByteBuffer(view.buffer<float>(), tensors[0].bytes());
+}
+
+JNIEXPORT jlong JNICALL PACKET_CREATOR_METHOD(nativeCreatePoseTensorImage)(
+    JNIEnv*, jobject, jlong context) {
+  auto frame = std::make_shared<mediapipe::ImageFrame>(mediapipe::ImageFormat::SRGB, 256, 256);
+  frame->SetToZero();
+  return CreatePacketWithContext(context, mediapipe::MakePacket<mediapipe::Image>(frame));
+}
+
+JNIEXPORT jlong JNICALL PACKET_CREATOR_METHOD(nativeCreatePoseTensorFromGlBuffer)(
+    JNIEnv* env, jobject, jlong context, jint buffer) {
+#if !MEDIAPIPE_DISABLE_GPU && MEDIAPIPE_OPENGL_ES_VERSION >= MEDIAPIPE_OPENGL_ES_31
+  auto* graph = reinterpret_cast<mediapipe::android::Graph*>(context);
+  auto* resources = graph->GetGpuResources();
+  if (!resources || !glIsBuffer(buffer)) {
+    ThrowIfError(env, absl::InvalidArgumentError("Pose tensor needs a shared SSBO and GPU graph."));
+    return 0;
+  }
+  constexpr int kBytes = 256 * 256 * 3 * sizeof(float);
+  GLint previous_read = 0;
+  glGetIntegerv(GL_COPY_READ_BUFFER_BINDING, &previous_read);
+  glBindBuffer(GL_COPY_READ_BUFFER, buffer);
+  GLint size = 0;
+  glGetBufferParameteriv(GL_COPY_READ_BUFFER, GL_BUFFER_SIZE, &size);
+  glBindBuffer(GL_COPY_READ_BUFFER, previous_read);
+  if (size != kBytes || glGetError() != GL_NO_ERROR) {
+    ThrowIfError(env, absl::InvalidArgumentError("Pose SSBO must contain exactly 256x256x3 floats."));
+    return 0;
+  }
+  GLsync producer = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+  if (!producer) {
+    ThrowIfError(env, absl::InternalError("Could not fence app pose tensor producer."));
+    return 0;
+  }
+  glFlush();
+  GLsync consumed = nullptr;
+  std::vector<mediapipe::Tensor> tensors;
+  const auto status = resources->gl_context()->Run([&]() -> absl::Status {
+    glWaitSync(producer, 0, GL_TIMEOUT_IGNORED);
+    tensors.emplace_back(mediapipe::Tensor::ElementType::kFloat32,
+                         mediapipe::Tensor::Shape{1, 256, 256, 3},
+                         graph->GetMemoryManager());
+    {
+      auto view = tensors.front().GetOpenGlBufferWriteView();
+      GLint old_read = 0, old_write = 0;
+      glGetIntegerv(GL_COPY_READ_BUFFER_BINDING, &old_read);
+      glGetIntegerv(GL_COPY_WRITE_BUFFER_BINDING, &old_write);
+      glBindBuffer(GL_COPY_READ_BUFFER, buffer);
+      glBindBuffer(GL_COPY_WRITE_BUFFER, view.name());
+      glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, 0, 0, kBytes);
+      glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
+      glBindBuffer(GL_COPY_READ_BUFFER, old_read);
+      glBindBuffer(GL_COPY_WRITE_BUFFER, old_write);
+    }
+    consumed = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    glFlush();
+    if (!consumed || glGetError() != GL_NO_ERROR) {
+      return absl::InternalError("GPU pose tensor copy/fence failed; retire the app SSBO.");
+    }
+    return absl::OkStatus();
+  });
+  glDeleteSync(producer);
+  if (consumed) {
+    glWaitSync(consumed, 0, GL_TIMEOUT_IGNORED);
+    glDeleteSync(consumed);
+  }
+  if (!status.ok()) { ThrowIfError(env, status); return 0; }
+  if (glGetError() != GL_NO_ERROR) {
+    ThrowIfError(env, absl::InternalError("Failed to order pose SSBO reuse; retire the app SSBO."));
+    return 0;
+  }
+  return CreatePacketWithContext(context,
+      mediapipe::MakePacket<std::vector<mediapipe::Tensor>>(std::move(tensors)));
+#else
+  ThrowIfError(env, absl::UnimplementedError("Pose SSBO tensors require OpenGL ES 3.1."));
+  return 0;
+#endif
+}
 
 JNIEXPORT jlong JNICALL PACKET_CREATOR_METHOD(nativeCreateReferencePacket)(
     JNIEnv* env, jobject thiz, jlong context, jlong packet) {

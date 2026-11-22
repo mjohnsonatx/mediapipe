@@ -100,6 +100,7 @@ cc_library(
         "//mediapipe/framework/formats:image_format_cc_proto",
         "//mediapipe/framework/formats:image_frame",
         "//mediapipe/framework/formats:matrix",
+        "//mediapipe/framework/formats:tensor",
         "//mediapipe/framework/formats:time_series_header_cc_proto",
         "//mediapipe/framework/formats:video_stream_header",
         "//mediapipe/framework/port:core_proto",

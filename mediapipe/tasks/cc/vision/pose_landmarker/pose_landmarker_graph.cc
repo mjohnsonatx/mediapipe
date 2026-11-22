@@ -29,6 +29,7 @@ limitations under the License.
 #include "mediapipe/framework/formats/image.h"
 #include "mediapipe/framework/formats/landmark.pb.h"
 #include "mediapipe/framework/formats/rect.pb.h"
+#include "mediapipe/framework/formats/tensor.h"
 #include "mediapipe/framework/port/status_macros.h"
 #include "mediapipe/tasks/cc/components/utils/gate.h"
 #include "mediapipe/tasks/cc/core/model_asset_bundle_resources.h"
@@ -68,6 +69,7 @@ using ::mediapipe::tasks::vision::pose_landmarker::proto::
     PoseLandmarksDetectorGraphOptions;
 
 constexpr char kImageTag[] = "IMAGE";
+constexpr char kExternalTensorsTag[] = "EXTERNAL_TENSORS";
 constexpr char kNormRectTag[] = "NORM_RECT";
 constexpr char kExternalPoseRectTag[] = "EXTERNAL_POSE_RECT";
 constexpr char kUseExternalPoseRectTag[] = "USE_EXTERNAL_POSE_RECT";
@@ -319,6 +321,14 @@ class PoseLandmarkerGraph : public core::ModelTaskGraph {
       use_external_source_projection_in =
           graph.In(kUseExternalSourceProjectionTag).Cast<bool>();
     }
+    std::optional<Source<std::vector<Tensor>>> external_tensors_in;
+    if (HasInput(sc->OriginalNode(), kExternalTensorsTag)) {
+      if (!sc->Options<PoseLandmarkerGraphOptions>().base_options().use_stream_mode() ||
+          sc->Options<PoseLandmarkerGraphOptions>().pose_detector_graph_options().num_poses() != 1) {
+        return absl::InvalidArgumentError("Prepared pose tensors require single-pose VIDEO tracking.");
+      }
+      external_tensors_in = graph.In(kExternalTensorsTag).Cast<std::vector<Tensor>>();
+    }
     std::optional<Source<bool>> reset_tracking_in;
     if (HasInput(sc->OriginalNode(), kResetTrackingTag)) {
       reset_tracking_in = graph.In(kResetTrackingTag).Cast<bool>();
@@ -344,7 +354,7 @@ class PoseLandmarkerGraph : public core::ModelTaskGraph {
                        external_source_projection_rect_in,
                        external_source_image_size_in,
                        use_external_source_projection_in,
-                       reset_tracking_in, graph, output_segmentation_masks,
+                       reset_tracking_in, external_tensors_in, graph, output_segmentation_masks,
                        output_image));
     outs.landmark_lists >>
         graph[Output<std::vector<NormalizedLandmarkList>>(kNormLandmarksTag)];
@@ -386,7 +396,8 @@ class PoseLandmarkerGraph : public core::ModelTaskGraph {
           external_source_projection_rect_in,
       std::optional<Source<std::pair<int, int>>> external_source_image_size_in,
       std::optional<Source<bool>> use_external_source_projection_in,
-      std::optional<Source<bool>> reset_tracking_in, Graph& graph,
+      std::optional<Source<bool>> reset_tracking_in,
+      std::optional<Source<std::vector<Tensor>>> external_tensors_in, Graph& graph,
       bool output_segmentation_masks, bool output_image) {
     const int max_num_poses =
         tasks_options.pose_detector_graph_options().num_poses();
@@ -429,6 +440,9 @@ class PoseLandmarkerGraph : public core::ModelTaskGraph {
 
     image_in >> pose_landmarks_detector_graph.In(kImageTag);
     clipped_pose_rects >> pose_landmarks_detector_graph.In(kNormRectTag);
+    if (external_tensors_in) {
+      *external_tensors_in >> pose_landmarks_detector_graph.In(kExternalTensorsTag);
+    }
     if (external_source_projection_rect_in && external_source_image_size_in &&
         use_external_source_projection_in) {
       *external_source_projection_rect_in >>

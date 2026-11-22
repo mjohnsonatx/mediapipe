@@ -58,6 +58,44 @@ public class PacketCreator {
     mediapipeGraph = context;
   }
 
+  /** Creates a graph-owned, initially unwritten [1,256,256,3] FLOAT32 pose tensor. */
+  public Packet createCpuPoseTensor() {
+    return Packet.create(nativeCreatePoseTensor(mediapipeGraph.getNativeHandle(), true));
+  }
+
+  /** Empty-vector timestamp sentinel for acquisition on a tensor-capable VIDEO graph. */
+  public Packet createEmptyPoseTensorVector() {
+    return Packet.create(nativeCreatePoseTensor(mediapipeGraph.getNativeHandle(), false));
+  }
+
+  /**
+   * Returns the one writable view of a newly created CPU pose tensor. Fill every float before
+   * graph submission. Do not retain/access this buffer after releasing its packet, or write to
+   * it while inference is running. This is native-owned memory, not a copied Java buffer.
+   */
+  public ByteBuffer getCpuPoseTensorBuffer(Packet packet) {
+    return nativeGetCpuPoseTensorBuffer(packet.getNativeHandle()).order(ByteOrder.nativeOrder());
+  }
+
+  /**
+   * Copies app-normalized float RGB from a shared ES3.1 SSBO to a graph-owned Tensor. The caller
+   * keeps the SSBO; GPU producer/consumer fences protect its reuse without a CPU wait/readback.
+   */
+  public Packet createPoseTensorFromGlBuffer(int buffer) {
+    if (buffer == 0) throw new IllegalArgumentException("Pose tensor SSBO must be nonzero.");
+    return Packet.create(nativeCreatePoseTensorFromGlBuffer(mediapipeGraph.getNativeHandle(), buffer));
+  }
+
+  /** Immutable size-only image used by prepared-tensor tracking; never sent to a pixel reader. */
+  public Packet createPoseTensorImage() {
+    return Packet.create(nativeCreatePoseTensorImage(mediapipeGraph.getNativeHandle()));
+  }
+
+  private native long nativeCreatePoseTensor(long context, boolean allocate);
+  private native ByteBuffer nativeGetCpuPoseTensorBuffer(long packet);
+  private native long nativeCreatePoseTensorFromGlBuffer(long context, int buffer);
+  private native long nativeCreatePoseTensorImage(long context);
+
   /**
    * Create a MediaPipe Packet that contains a pointer to another MediaPipe packet.
    *

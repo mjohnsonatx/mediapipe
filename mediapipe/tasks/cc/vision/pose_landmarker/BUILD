@@ -50,9 +50,40 @@ cc_library(
 )
 
 cc_library(
+    name = "pose_tensor_input_calculator",
+    srcs = ["pose_tensor_input_calculator.cc"],
+    deps = [
+        "//mediapipe/framework:calculator_framework",
+        "//mediapipe/framework/formats:image",
+        "//mediapipe/framework/formats:rect_cc_proto",
+        "//mediapipe/framework/formats:tensor",
+        "//mediapipe/framework/port:ret_check",
+    ],
+    alwayslink = 1,
+)
+
+cc_test(
+    name = "pose_tensor_input_calculator_test",
+    srcs = ["pose_tensor_input_calculator_test.cc"],
+    deps = [
+        ":pose_tensor_input_calculator",
+        "//mediapipe/framework:calculator_framework",
+        "//mediapipe/framework:calculator_runner",
+        "//mediapipe/framework/formats:image",
+        "//mediapipe/framework/formats:image_frame",
+        "//mediapipe/framework/formats:rect_cc_proto",
+        "//mediapipe/framework/formats:tensor",
+        "//mediapipe/framework/port:gtest_main",
+        "//mediapipe/framework/port:parse_text_proto",
+    ],
+)
+
+cc_library(
     name = "pose_landmarks_detector_graph",
     srcs = ["pose_landmarks_detector_graph.cc"],
     deps = [
+        ":pose_tensor_input_calculator",
+        "//mediapipe/framework/formats:tensor",
         "//mediapipe/calculators/core:begin_loop_calculator",
         "//mediapipe/calculators/core:concatenate_vector_calculator",
         "//mediapipe/calculators/core:constant_side_packet_calculator",
@@ -139,6 +170,7 @@ cc_library(
         "//mediapipe/framework/formats:landmark_cc_proto",
         "//mediapipe/framework/formats:rect_cc_proto",
         "//mediapipe/framework/port:status",
+        "//mediapipe/framework/formats:tensor",
         "//mediapipe/tasks/cc/components/utils:gate",
         "//mediapipe/tasks/cc/core:model_asset_bundle_resources",
         "//mediapipe/tasks/cc/core:model_resources_cache",
@@ -190,6 +222,7 @@ cc_test(
         "//mediapipe/framework/formats:image_format_cc_proto",
         "//mediapipe/framework/formats:image_frame",
         "//mediapipe/framework/formats:rect_cc_proto",
+        "//mediapipe/framework/formats:tensor",
         "//mediapipe/framework/port:gtest_main",
         "//mediapipe/framework/tool:sink",
         "//mediapipe/tasks/cc/vision/pose_landmarker/proto:pose_landmarker_graph_options_cc_proto",

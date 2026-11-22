@@ -13,6 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <array>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -39,6 +40,7 @@ limitations under the License.
 #include "mediapipe/framework/formats/image.h"
 #include "mediapipe/framework/formats/landmark.pb.h"
 #include "mediapipe/framework/formats/rect.pb.h"
+#include "mediapipe/framework/formats/tensor.h"
 #include "mediapipe/framework/subgraph.h"
 #include "mediapipe/gpu/gpu_origin.pb.h"
 #include "mediapipe/tasks/cc/common.h"
@@ -71,6 +73,7 @@ using ::mediapipe::tasks::vision::pose_landmarker::proto::
     PoseLandmarksDetectorGraphOptions;
 
 constexpr char kImageTag[] = "IMAGE";
+constexpr char kExternalTensorsTag[] = "EXTERNAL_TENSORS";
 constexpr char kNormRectTag[] = "NORM_RECT";
 constexpr char kExternalSourceProjectionRectTag[] =
     "EXTERNAL_SOURCE_PROJECTION_RECT";
@@ -351,6 +354,10 @@ class SinglePoseLandmarksDetectorGraph : public core::ModelTaskGraph {
       use_external_source_projection =
           graph.In(kUseExternalSourceProjectionTag).Cast<bool>();
     }
+    std::optional<Source<std::vector<Tensor>>> external_tensors;
+    if (HasInput(sc->OriginalNode(), kExternalTensorsTag)) {
+      external_tensors = graph.In(kExternalTensorsTag).Cast<std::vector<Tensor>>();
+    }
     ABSL_ASSIGN_OR_RETURN(
         auto pose_landmark_detection_outs,
         BuildSinglePoseLandmarksDetectorGraph(
@@ -358,7 +365,7 @@ class SinglePoseLandmarksDetectorGraph : public core::ModelTaskGraph {
             graph[Input<Image>(kImageTag)],
             graph[Input<NormalizedRect>::Optional(kNormRectTag)],
             external_source_projection_rect, external_source_image_size,
-            use_external_source_projection, graph, output_segmentation_mask));
+            use_external_source_projection, external_tensors, graph, output_segmentation_mask));
     pose_landmark_detection_outs.pose_landmarks >>
         graph[Output<NormalizedLandmarkList>(kLandmarksTag)];
     pose_landmark_detection_outs.world_pose_landmarks >>
@@ -387,9 +394,29 @@ class SinglePoseLandmarksDetectorGraph : public core::ModelTaskGraph {
       Source<NormalizedRect> pose_rect,
       std::optional<Source<NormalizedRect>> external_source_projection_rect,
       std::optional<Source<std::pair<int, int>>> external_source_image_size,
-      std::optional<Source<bool>> use_external_source_projection, Graph& graph,
+      std::optional<Source<bool>> use_external_source_projection,
+      std::optional<Source<std::vector<Tensor>>> external_tensors, Graph& graph,
       bool output_segmentation_mask) {
     ABSL_RETURN_IF_ERROR(SanityCheckOptions(subgraph_options));
+
+    ABSL_ASSIGN_OR_RETURN(auto image_tensor_specs,
+                          BuildInputImageTensorSpecs(model_resources));
+    if (external_tensors) {
+      // The app's converter is deliberately model-specific. Reject a future model change
+      // at construction instead of silently feeding a tensor with the wrong normalization.
+      if (image_tensor_specs.image_width != 256 || image_tensor_specs.image_height != 256 ||
+          image_tensor_specs.tensor_type != tflite::TensorType_FLOAT32 ||
+          image_tensor_specs.color_space != tflite::ColorSpaceType_RGB ||
+          !image_tensor_specs.normalization_options) {
+        return absl::InvalidArgumentError("Prepared pose input requires 256x256 FLOAT32 RGB metadata.");
+      }
+      const auto& norm = *image_tensor_specs.normalization_options;
+      for (int c = 0; c < norm.num_values; ++c) {
+        if (norm.mean_values[c] != 0.0f || norm.std_values[c] != 255.0f) {
+          return absl::InvalidArgumentError("Prepared pose input requires RGB normalization x/255.");
+        }
+      }
+    }
 
     auto& preprocessing = graph.AddNode(
         "mediapipe.tasks.components.processors.ImagePreprocessingGraph");
@@ -402,11 +429,30 @@ class SinglePoseLandmarksDetectorGraph : public core::ModelTaskGraph {
             subgraph_options.base_options().gpu_origin(),
             &preprocessing.GetOptions<tasks::components::processors::proto::
                                           ImagePreprocessingGraphOptions>()));
-    image_in >> preprocessing.In(kImageTag);
-    pose_rect >> preprocessing.In(kNormRectTag);
-    auto image_size = preprocessing[Output<std::pair<int, int>>(kImageSizeTag)];
-    auto matrix = preprocessing[Output<std::vector<float>>(kMatrixTag)];
-    auto letterbox_padding = preprocessing.Out(kLetterboxPaddingTag);
+    Stream<Image> preprocessing_image = image_in;
+    Stream<NormalizedRect> preprocessing_rect = pose_rect;
+    Stream<std::vector<Tensor>> input_tensors =
+        preprocessing[Output<std::vector<Tensor>>(kTensorsTag)];
+    Stream<std::array<float, 16>> matrix =
+        preprocessing[Output<std::array<float, 16>>(kMatrixTag)];
+    Stream<std::array<float, 4>> letterbox_padding =
+        preprocessing[Output<std::array<float, 4>>(kLetterboxPaddingTag)];
+    if (external_tensors) {
+      auto& input = graph.AddNode("PoseTensorInputCalculator");
+      *external_tensors >> input.In(kExternalTensorsTag);
+      image_in >> input.In(kImageTag);
+      pose_rect >> input.In(kNormRectTag);
+      preprocessing_image = input.Out(kImageTag).Cast<Image>();
+      preprocessing_rect = input.Out(kNormRectTag).Cast<NormalizedRect>();
+      input_tensors = Merge(input.Out(kTensorsTag).Cast<std::vector<Tensor>>(), input_tensors, graph);
+      matrix = Merge(input.Out(kMatrixTag).Cast<std::array<float, 16>>(), matrix, graph);
+      letterbox_padding = Merge(input.Out(kLetterboxPaddingTag).Cast<std::array<float, 4>>(),
+                               letterbox_padding, graph);
+    }
+    preprocessing_image >> preprocessing.In(kImageTag);
+    preprocessing_rect >> preprocessing.In(kNormRectTag);
+    // Size is metadata only. It is also needed when preprocessing has no packet this timestamp.
+    auto image_size = GetImageSize(image_in, graph);
 
     // The application may have already transformed a source-image ROI into
     // IMAGE. Keep preprocessing on the complete supplied image, then project
@@ -432,12 +478,9 @@ class SinglePoseLandmarksDetectorGraph : public core::ModelTaskGraph {
           Merge(enabled_source_image_size, image_size, graph);
     }
 
-    ABSL_ASSIGN_OR_RETURN(auto image_tensor_specs,
-                          BuildInputImageTensorSpecs(model_resources));
-
     auto& inference = AddInference(
         model_resources, subgraph_options.base_options().acceleration(), graph);
-    preprocessing.Out(kTensorsTag) >> inference.In(kTensorsTag);
+    input_tensors >> inference.In(kTensorsTag);
 
     // Split model output tensors to multiple streams.
     auto& split_tensors_vector = graph.AddNode("SplitTensorVectorCalculator");
@@ -766,6 +809,10 @@ class MultiplePoseLandmarksDetectorGraph : public core::ModelTaskGraph {
       use_external_source_projection =
           graph.In(kUseExternalSourceProjectionTag).Cast<bool>();
     }
+    std::optional<Source<std::vector<Tensor>>> external_tensors;
+    if (HasInput(sc->OriginalNode(), kExternalTensorsTag)) {
+      external_tensors = graph.In(kExternalTensorsTag).Cast<std::vector<Tensor>>();
+    }
     ABSL_ASSIGN_OR_RETURN(
         auto pose_landmark_detection_outputs,
         BuildPoseLandmarksDetectorGraph(
@@ -773,7 +820,7 @@ class MultiplePoseLandmarksDetectorGraph : public core::ModelTaskGraph {
             graph[Input<Image>(kImageTag)],
             graph[Input<std::vector<NormalizedRect>>(kNormRectTag)],
             external_source_projection_rect, external_source_image_size,
-            use_external_source_projection, graph,
+            use_external_source_projection, external_tensors, graph,
             output_segmentation_masks));
     pose_landmark_detection_outputs.landmark_lists >>
         graph[Output<std::vector<NormalizedLandmarkList>>(kLandmarksTag)];
@@ -802,7 +849,8 @@ class MultiplePoseLandmarksDetectorGraph : public core::ModelTaskGraph {
       Source<std::vector<NormalizedRect>> multi_pose_rects,
       std::optional<Source<NormalizedRect>> external_source_projection_rect,
       std::optional<Source<std::pair<int, int>>> external_source_image_size,
-      std::optional<Source<bool>> use_external_source_projection, Graph& graph,
+      std::optional<Source<bool>> use_external_source_projection,
+      std::optional<Source<std::vector<Tensor>>> external_tensors, Graph& graph,
       bool output_segmentation_masks) {
     Stream<std::pair<int, int>> smoothing_image_size =
         GetImageSize(image_in, graph);
@@ -851,6 +899,13 @@ class MultiplePoseLandmarksDetectorGraph : public core::ModelTaskGraph {
         subgraph_options;
     image >> pose_landmark_subgraph.In(kImageTag);
     pose_rect >> pose_landmark_subgraph.In(kNormRectTag);
+    if (external_tensors) {
+      // CLONE indices must remain contiguous for callers without source-projection inputs.
+      const int tensor_clone_index = loop_source_projection_rect ? 4 : 1;
+      *external_tensors >> begin_loop_multi_pose_rects.In("CLONE")[tensor_clone_index];
+      begin_loop_multi_pose_rects.Out("CLONE")[tensor_clone_index] >>
+          pose_landmark_subgraph.In(kExternalTensorsTag);
+    }
     if (loop_source_projection_rect && loop_source_image_size &&
         loop_use_external_source_projection) {
       *loop_source_projection_rect >>

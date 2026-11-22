@@ -212,6 +212,18 @@ void RegisterPacketCreatorNatives(JNIEnv* env) {
 
   std::vector<JNINativeMethodStrings> packet_creator_methods;
   AddJNINativeMethod(&packet_creator_methods, packet_creator,
+                     "nativeCreatePoseTensor", "(JZ)J",
+                     (void*)&PACKET_CREATOR_METHOD(nativeCreatePoseTensor));
+  AddJNINativeMethod(&packet_creator_methods, packet_creator,
+                     "nativeGetCpuPoseTensorBuffer", "(J)Ljava/nio/ByteBuffer;",
+                     (void*)&PACKET_CREATOR_METHOD(nativeGetCpuPoseTensorBuffer));
+  AddJNINativeMethod(&packet_creator_methods, packet_creator,
+                     "nativeCreatePoseTensorFromGlBuffer", "(JI)J",
+                     (void*)&PACKET_CREATOR_METHOD(nativeCreatePoseTensorFromGlBuffer));
+  AddJNINativeMethod(&packet_creator_methods, packet_creator,
+                     "nativeCreatePoseTensorImage", "(J)J",
+                     (void*)&PACKET_CREATOR_METHOD(nativeCreatePoseTensorImage));
+  AddJNINativeMethod(&packet_creator_methods, packet_creator,
                      "nativeCreateRgbImage", "(JLjava/nio/ByteBuffer;II)J",
                      (void*)&PACKET_CREATOR_METHOD(nativeCreateRgbImage));
   AddJNINativeMethod(&packet_creator_methods, packet_creator,

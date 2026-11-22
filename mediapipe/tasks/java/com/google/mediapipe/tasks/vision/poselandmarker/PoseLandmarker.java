@@ -82,6 +82,7 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
   private static final String IMAGE_IN_STREAM_NAME = "image_in";
   private static final String NORM_RECT_IN_STREAM_NAME = "norm_rect_in";
   private static final String EXTERNAL_POSE_RECT_IN_STREAM_NAME = "external_pose_rect_in";
+  private static final String EXTERNAL_TENSORS_IN_STREAM_NAME = "external_tensors_in";
   private static final String USE_EXTERNAL_POSE_RECT_IN_STREAM_NAME =
       "use_external_pose_rect_in";
   private static final String EXTERNAL_SOURCE_PROJECTION_RECT_IN_STREAM_NAME =
@@ -189,6 +190,9 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
       Context context, PoseLandmarkerOptions landmarkerOptions, long parentGlContext) {
     List<String> inputStreams = new ArrayList<>(BASE_INPUT_STREAMS);
     if (landmarkerOptions.runningMode() == RunningMode.VIDEO) {
+      if (landmarkerOptions.appTensorInput().orElse(false)) {
+        inputStreams.add("EXTERNAL_TENSORS:" + EXTERNAL_TENSORS_IN_STREAM_NAME);
+      }
       inputStreams.add("EXTERNAL_POSE_RECT:" + EXTERNAL_POSE_RECT_IN_STREAM_NAME);
       inputStreams.add(
           "USE_EXTERNAL_POSE_RECT:" + USE_EXTERNAL_POSE_RECT_IN_STREAM_NAME);
@@ -296,7 +300,8 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
             handler,
             parentGlContext);
     return new PoseLandmarker(runner, landmarkerOptions.runningMode(),
-        landmarkerOptions.borrowedImageInput().orElse(false));
+        landmarkerOptions.borrowedImageInput().orElse(false),
+        landmarkerOptions.appTensorInput().orElse(false));
   }
 
   @SuppressWarnings("ConstantCaseForConstants")
@@ -310,13 +315,102 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
    * @param runningMode a mediapipe vision task {@link RunningMode}.
    */
   private final boolean borrowedImageInput;
+  private final boolean appTensorInput;
+  // Confined to the synchronous VIDEO caller; close follows the caller's inference drain.
+  private Packet tensorImage;
+  private Packet emptyTensorVector;
   private final java.util.concurrent.atomic.AtomicInteger borrowedImages =
       new java.util.concurrent.atomic.AtomicInteger();
   private final Runnable borrowedImageReleased = () -> borrowedImages.set(0);
 
-  private PoseLandmarker(TaskRunner taskRunner, RunningMode runningMode, boolean borrowedImageInput) {
+  private PoseLandmarker(TaskRunner taskRunner, RunningMode runningMode, boolean borrowedImageInput,
+      boolean appTensorInput) {
     super(taskRunner, runningMode, IMAGE_IN_STREAM_NAME, NORM_RECT_IN_STREAM_NAME);
     this.borrowedImageInput = borrowedImageInput;
+    this.appTensorInput = appTensorInput;
+  }
+
+  /**
+   * One native-owned CPU input. Fill all 256x256x3 RGB floats in [0,1], then submit exactly once.
+   * Do not write during/after submission or access the buffer after close. The caller closes this
+   * handle in finally after the synchronous call, before closing the landmarker; native packets
+   * retain their own ownership. Like detectForVideo, this API requires serialized owner access.
+   */
+  public static final class CpuPoseTensor implements AutoCloseable {
+    private final PoseLandmarker owner;
+    private final java.nio.ByteBuffer buffer;
+    private Packet packet;
+    private boolean submitted;
+
+    private CpuPoseTensor(PoseLandmarker owner, Packet packet, java.nio.ByteBuffer buffer) {
+      this.owner = owner;
+      this.packet = packet;
+      this.buffer = buffer;
+    }
+
+    public java.nio.ByteBuffer buffer() {
+      if (packet == null || submitted) throw new IllegalStateException("Pose tensor is not writable.");
+      return buffer;
+    }
+
+    @Override public void close() {
+      if (packet != null) { packet.release(); packet = null; }
+    }
+  }
+
+  /** Allocates native input storage; the application writes directly, with no RGB buffer copy. */
+  public CpuPoseTensor createCpuPoseTensor() {
+    requireAppTensorInput();
+    Packet packet = runner.getPacketCreator().createCpuPoseTensor();
+    try {
+      return new CpuPoseTensor(this, packet, runner.getPacketCreator().getCpuPoseTensorBuffer(packet));
+    } catch (RuntimeException | Error failure) {
+      packet.release();
+      throw failure;
+    }
+  }
+
+  /** Skips landmark image preprocessing; returns crop-local results for the app's frozen ROI. */
+  public PoseLandmarkerResult detectForVideoWithTensor(CpuPoseTensor tensor, long timestampMs) {
+    requireAppTensorInput();
+    if (tensor.owner != this || tensor.packet == null || tensor.submitted) {
+      throw new IllegalArgumentException("Pose tensor must be fresh and owned by this landmarker.");
+    }
+    tensor.submitted = true;
+    return processPreparedPoseTensor(tensor.packet.copy(), timestampMs);
+  }
+
+  /**
+   * GPU counterpart: accepts an app-normalized FLOAT32 RGB SSBO. The native bridge performs one
+   * device-to-device copy and GPU fences, never CPU readback. The caller keeps SSBO and texture
+   * ownership and must retire the SSBO if this call fails before reuse ordering can be confirmed.
+   */
+  public PoseLandmarkerResult detectForVideoWithTensor(int rgbSsbo, long timestampMs) {
+    requireAppTensorInput();
+    return processPreparedPoseTensor(runner.getPacketCreator().createPoseTensorFromGlBuffer(rgbSsbo),
+        timestampMs);
+  }
+
+  private void requireAppTensorInput() {
+    if (!appTensorInput) throw new IllegalStateException("Enable app tensor input at construction.");
+  }
+
+  private PoseLandmarkerResult processPreparedPoseTensor(Packet tensors, long timestampMs) {
+    try {
+      if (tensorImage == null) tensorImage = runner.getPacketCreator().createPoseTensorImage();
+      return processVideoPackets(tensorImage.copy(), FULL_IMAGE_TRACKING_RECT.toProto(),
+          Optional.of(FULL_IMAGE_TRACKING_RECT), Optional.empty(), 256, 256, timestampMs, tensors);
+    } finally {
+      tensors.release();
+    }
+  }
+
+  @Override public void close() {
+    // Packet handles belong to Graph's registry and cannot be released after teardown. Any
+    // in-flight graph packets hold independent references to the immutable payloads.
+    if (tensorImage != null) { tensorImage.release(); tensorImage = null; }
+    if (emptyTensorVector != null) { emptyTensorVector.release(); emptyTensorVector = null; }
+    super.close();
   }
 
   /**
@@ -514,6 +608,15 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
   }
 
   /**
+   * Runs on an application-cropped image and returns crop-space pose landmarks, world landmarks,
+   * and next-frame rectangles. The caller must project these outputs through the same source ROI
+   * used to make the input image before tracking or smoothing them.
+   */
+  public PoseLandmarkerResult detectForVideoWithAppProjection(MPImage image, long timestampMs) {
+    return detectForVideoWithExternalRoiCrop(image, timestampMs);
+  }
+
+  /**
    * Performs tracked pose landmark detection on an application-cropped image while preserving
    * MediaPipe's source-space landmark projection and temporal smoothing.
    *
@@ -577,6 +680,11 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
         /* sourceImageWidth= */ 0,
         /* sourceImageHeight= */ 0,
         timestampMs);
+  }
+
+  /** Texture counterpart of {@link #detectForVideoWithAppProjection(MPImage, long)}. */
+  public PoseLandmarkerResult detectForVideoWithAppProjection(TextureFrame image, long timestampMs) {
+    return detectForVideoWithExternalRoiCrop(image, timestampMs);
   }
 
   /** Texture counterpart that preserves source-space projection and smoothing. */
@@ -706,9 +814,31 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
       int sourceImageWidth,
       int sourceImageHeight,
       long timestampMs) {
+    return processVideoPackets(imagePacket, imageRect, externalPoseRect,
+        externalSourceProjectionRect, sourceImageWidth, sourceImageHeight, timestampMs, null);
+  }
+
+  private PoseLandmarkerResult processVideoPackets(
+      Packet imagePacket,
+      RectProto.NormalizedRect imageRect,
+      Optional<NormalizedRect> externalPoseRect,
+      Optional<NormalizedRect> externalSourceProjectionRect,
+      int sourceImageWidth,
+      int sourceImageHeight,
+      long timestampMs,
+      Packet externalTensors) {
     Map<String, Packet> inputPackets = new HashMap<>();
     inputPackets.put(IMAGE_IN_STREAM_NAME, imagePacket);
     try {
+      if (appTensorInput) {
+        if (externalTensors == null) {
+          if (emptyTensorVector == null) {
+            emptyTensorVector = runner.getPacketCreator().createEmptyPoseTensorVector();
+          }
+          externalTensors = emptyTensorVector.copy();
+        }
+        inputPackets.put(EXTERNAL_TENSORS_IN_STREAM_NAME, externalTensors);
+      }
       inputPackets.put(
           NORM_RECT_IN_STREAM_NAME, runner.getPacketCreator().createProto(imageRect));
       inputPackets.put(
@@ -879,6 +1009,8 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
       public abstract Builder setSmoothLandmarks(Boolean value);
       /** VIDEO-only opt-in for direct RGBA inputs; bitmap inputs keep the copying path. */
       public abstract Builder setBorrowedImageInput(Boolean value);
+      /** Opt-in single-pose VIDEO input; requires the matching prepared-tensor native graph. */
+      public abstract Builder setAppTensorInput(Boolean value);
 
       public abstract Builder setOutputSegmentationMasks(boolean value);
 
@@ -903,6 +1035,12 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
        */
       public final PoseLandmarkerOptions build() {
         PoseLandmarkerOptions options = autoBuild();
+        if (options.appTensorInput().orElse(false) &&
+            (options.runningMode() != RunningMode.VIDEO || options.numPoses().orElse(1) != 1 ||
+             options.outputSegmentationMasks())) {
+          throw new IllegalArgumentException(
+              "App tensor input requires single-pose VIDEO mode without segmentation masks.");
+        }
         if (options.borrowedImageInput().orElse(false) && options.runningMode() != RunningMode.VIDEO) {
           throw new IllegalArgumentException("Borrowed image input requires synchronous VIDEO mode.");
         }
@@ -937,6 +1075,7 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
 
     abstract Optional<Boolean> smoothLandmarks();
     abstract Optional<Boolean> borrowedImageInput();
+    abstract Optional<Boolean> appTensorInput();
 
     @Override
     public void configureGraph(com.google.mediapipe.proto.CalculatorProto.CalculatorGraphConfig.Builder graph) {
