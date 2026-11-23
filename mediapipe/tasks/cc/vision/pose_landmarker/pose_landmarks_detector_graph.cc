@@ -113,7 +113,7 @@ struct SinglePoseLandmarkerOutputs {
   Source<NormalizedLandmarkList> pose_landmarks;
   Source<LandmarkList> world_pose_landmarks;
   Source<NormalizedLandmarkList> auxiliary_pose_landmarks;
-  Source<NormalizedRect> pose_rect_next_frame;
+  std::optional<Source<NormalizedRect>> pose_rect_next_frame;
   Source<bool> pose_presence;
   Source<float> pose_presence_score;
   std::optional<Source<Image>> segmentation_mask;
@@ -123,7 +123,7 @@ struct PoseLandmarkerOutputs {
   Source<std::vector<NormalizedLandmarkList>> landmark_lists;
   Source<std::vector<LandmarkList>> world_landmark_lists;
   Source<std::vector<NormalizedLandmarkList>> auxiliary_landmark_lists;
-  Source<std::vector<NormalizedRect>> pose_rects_next_frame;
+  std::optional<Source<std::vector<NormalizedRect>>> pose_rects_next_frame;
   Source<std::vector<bool>> presences;
   Source<std::vector<float>> presence_scores;
   std::optional<Source<std::vector<Image>>> segmentation_masks;
@@ -365,15 +365,18 @@ class SinglePoseLandmarksDetectorGraph : public core::ModelTaskGraph {
             graph[Input<Image>(kImageTag)],
             graph[Input<NormalizedRect>::Optional(kNormRectTag)],
             external_source_projection_rect, external_source_image_size,
-            use_external_source_projection, external_tensors, graph, output_segmentation_mask));
+            use_external_source_projection, external_tensors, graph,
+            output_segmentation_mask, HasOutput(sc->OriginalNode(), kPoseRectNextFrameTag)));
     pose_landmark_detection_outs.pose_landmarks >>
         graph[Output<NormalizedLandmarkList>(kLandmarksTag)];
     pose_landmark_detection_outs.world_pose_landmarks >>
         graph[Output<LandmarkList>(kWorldLandmarksTag)];
     pose_landmark_detection_outs.auxiliary_pose_landmarks >>
         graph[Output<NormalizedLandmarkList>(kAuxLandmarksTag)];
-    pose_landmark_detection_outs.pose_rect_next_frame >>
-        graph[Output<NormalizedRect>(kPoseRectNextFrameTag)];
+    if (pose_landmark_detection_outs.pose_rect_next_frame) {
+      *pose_landmark_detection_outs.pose_rect_next_frame >>
+          graph[Output<NormalizedRect>(kPoseRectNextFrameTag)];
+    }
     pose_landmark_detection_outs.pose_presence >>
         graph[Output<bool>(kPresenceTag)];
     pose_landmark_detection_outs.pose_presence_score >>
@@ -396,7 +399,7 @@ class SinglePoseLandmarksDetectorGraph : public core::ModelTaskGraph {
       std::optional<Source<std::pair<int, int>>> external_source_image_size,
       std::optional<Source<bool>> use_external_source_projection,
       std::optional<Source<std::vector<Tensor>>> external_tensors, Graph& graph,
-      bool output_segmentation_mask) {
+      bool output_segmentation_mask, bool output_next_rect) {
     ABSL_RETURN_IF_ERROR(SanityCheckOptions(subgraph_options));
 
     ABSL_ASSIGN_OR_RETURN(auto image_tensor_specs,
@@ -669,31 +672,34 @@ class SinglePoseLandmarksDetectorGraph : public core::ModelTaskGraph {
       segmentation_mask = warp_affine.Out(kImageTag).Cast<Image>();
     }
 
-    // Calculate region of interest based on auxiliary landmarks, to be used
-    // in the next frame. Consists of LandmarksToDetection +
-    // AlignmentPointsRects + RectTransformation.
+    std::optional<Source<NormalizedRect>> pose_rect_next_frame;
+    if (output_next_rect) {
+      // Calculate region of interest based on auxiliary landmarks, to be used
+      // in the next frame. Consists of LandmarksToDetection +
+      // AlignmentPointsRects + RectTransformation.
 
-    auto& auxiliary_landmarks_to_detection =
-        graph.AddNode("LandmarksToDetectionCalculator");
-    auxiliary_projected_landmarks >>
-        auxiliary_landmarks_to_detection.In(kNormLandmarksTag);
-    auto detection = auxiliary_landmarks_to_detection.Out(kDetectionTag);
+      auto& auxiliary_landmarks_to_detection =
+          graph.AddNode("LandmarksToDetectionCalculator");
+      auxiliary_projected_landmarks >>
+          auxiliary_landmarks_to_detection.In(kNormLandmarksTag);
+      auto detection = auxiliary_landmarks_to_detection.Out(kDetectionTag);
 
-    auto& detection_to_rect = graph.AddNode("AlignmentPointsRectsCalculator");
-    ConfigureAlignmentPointsRectsCalculator(
-        &detection_to_rect
-             .GetOptions<mediapipe::DetectionsToRectsCalculatorOptions>());
-    detection >> detection_to_rect.In(kDetectionTag);
-    projection_image_size >> detection_to_rect.In(kImageSizeTag);
-    auto raw_pose_rects = detection_to_rect.Out(kNormRectTag);
+      auto& detection_to_rect = graph.AddNode("AlignmentPointsRectsCalculator");
+      ConfigureAlignmentPointsRectsCalculator(
+          &detection_to_rect
+               .GetOptions<mediapipe::DetectionsToRectsCalculatorOptions>());
+      detection >> detection_to_rect.In(kDetectionTag);
+      projection_image_size >> detection_to_rect.In(kImageSizeTag);
+      auto raw_pose_rects = detection_to_rect.Out(kNormRectTag);
 
-    auto& rect_transformation = graph.AddNode("RectTransformationCalculator");
-    ConfigureRectTransformationCalculator(
-        &rect_transformation
-             .GetOptions<mediapipe::RectTransformationCalculatorOptions>());
-    projection_image_size >> rect_transformation.In(kImageSizeTag);
-    raw_pose_rects >> rect_transformation.In("NORM_RECT");
-    auto pose_rect_next_frame = rect_transformation[Output<NormalizedRect>("")];
+      auto& rect_transformation = graph.AddNode("RectTransformationCalculator");
+      ConfigureRectTransformationCalculator(
+          &rect_transformation
+               .GetOptions<mediapipe::RectTransformationCalculatorOptions>());
+      projection_image_size >> rect_transformation.In(kImageSizeTag);
+      raw_pose_rects >> rect_transformation.In("NORM_RECT");
+      pose_rect_next_frame = rect_transformation[Output<NormalizedRect>("")];
+    }
 
     return {{
         /* pose_landmarks= */ projected_landmarks,
@@ -821,15 +827,17 @@ class MultiplePoseLandmarksDetectorGraph : public core::ModelTaskGraph {
             graph[Input<std::vector<NormalizedRect>>(kNormRectTag)],
             external_source_projection_rect, external_source_image_size,
             use_external_source_projection, external_tensors, graph,
-            output_segmentation_masks));
+            output_segmentation_masks, HasOutput(sc->OriginalNode(), kPoseRectsNextFrameTag)));
     pose_landmark_detection_outputs.landmark_lists >>
         graph[Output<std::vector<NormalizedLandmarkList>>(kLandmarksTag)];
     pose_landmark_detection_outputs.world_landmark_lists >>
         graph[Output<std::vector<LandmarkList>>(kWorldLandmarksTag)];
     pose_landmark_detection_outputs.auxiliary_landmark_lists >>
         graph[Output<std::vector<NormalizedLandmarkList>>(kAuxLandmarksTag)];
-    pose_landmark_detection_outputs.pose_rects_next_frame >>
-        graph[Output<std::vector<NormalizedRect>>(kPoseRectsNextFrameTag)];
+    if (pose_landmark_detection_outputs.pose_rects_next_frame) {
+      *pose_landmark_detection_outputs.pose_rects_next_frame >>
+          graph[Output<std::vector<NormalizedRect>>(kPoseRectsNextFrameTag)];
+    }
     pose_landmark_detection_outputs.presences >>
         graph[Output<std::vector<bool>>(kPresenceTag)];
     pose_landmark_detection_outputs.presence_scores >>
@@ -851,7 +859,7 @@ class MultiplePoseLandmarksDetectorGraph : public core::ModelTaskGraph {
       std::optional<Source<std::pair<int, int>>> external_source_image_size,
       std::optional<Source<bool>> use_external_source_projection,
       std::optional<Source<std::vector<Tensor>>> external_tensors, Graph& graph,
-      bool output_segmentation_masks) {
+      bool output_segmentation_masks, bool output_next_rect) {
     Stream<std::pair<int, int>> smoothing_image_size =
         GetImageSize(image_in, graph);
     std::optional<Stream<std::pair<int, int>>> gated_source_image_size;
@@ -918,8 +926,6 @@ class MultiplePoseLandmarksDetectorGraph : public core::ModelTaskGraph {
     auto landmarks = pose_landmark_subgraph.Out(kLandmarksTag);
     auto world_landmarks = pose_landmark_subgraph.Out(kWorldLandmarksTag);
     auto auxiliary_landmarks = pose_landmark_subgraph.Out(kAuxLandmarksTag);
-    auto pose_rect_next_frame =
-        pose_landmark_subgraph.Out(kPoseRectNextFrameTag);
     auto presence = pose_landmark_subgraph.Out(kPresenceTag);
     auto presence_score = pose_landmark_subgraph.Out(kPresenceScoreTag);
 
@@ -946,13 +952,16 @@ class MultiplePoseLandmarksDetectorGraph : public core::ModelTaskGraph {
     auto auxiliary_landmark_lists = end_loop_auxiliary_landmarks
         [Output<std::vector<NormalizedLandmarkList>>(kIterableTag)];
 
-    auto& end_loop_rects_next_frame =
-        graph.AddNode("EndLoopNormalizedRectCalculator");
-    batch_end >> end_loop_rects_next_frame.In(kBatchEndTag);
-    pose_rect_next_frame >> end_loop_rects_next_frame.In(kItemTag);
-    auto pose_rects_next_frame =
-        end_loop_rects_next_frame[Output<std::vector<NormalizedRect>>(
-            kIterableTag)];
+    std::optional<Source<std::vector<NormalizedRect>>> pose_rects_next_frame;
+    if (output_next_rect) {
+      auto pose_rect_next_frame = pose_landmark_subgraph.Out(kPoseRectNextFrameTag);
+      auto& end_loop_rects_next_frame =
+          graph.AddNode("EndLoopNormalizedRectCalculator");
+      batch_end >> end_loop_rects_next_frame.In(kBatchEndTag);
+      pose_rect_next_frame >> end_loop_rects_next_frame.In(kItemTag);
+      pose_rects_next_frame = end_loop_rects_next_frame
+          [Output<std::vector<NormalizedRect>>(kIterableTag)];
+    }
 
     auto& end_loop_presence = graph.AddNode("EndLoopBooleanCalculator");
     batch_end >> end_loop_presence.In(kBatchEndTag);
@@ -989,8 +998,12 @@ class MultiplePoseLandmarksDetectorGraph : public core::ModelTaskGraph {
           GetItem(landmark_lists, zero_index, graph);
       Stream<LandmarkList> world_landmarks =
           GetItem(world_landmark_lists, zero_index, graph);
+      if (!pose_rects_next_frame) {
+        return absl::InvalidArgumentError(
+            "Native smoothing requires POSE_RECTS_NEXT_FRAME.");
+      }
       Stream<NormalizedRect> roi =
-          GetItem(pose_rects_next_frame, zero_index, graph);
+          GetItem(*pose_rects_next_frame, zero_index, graph);
 
       // Apply smoothing filter on pose landmarks.
       landmarks = SmoothLandmarksVisibility(

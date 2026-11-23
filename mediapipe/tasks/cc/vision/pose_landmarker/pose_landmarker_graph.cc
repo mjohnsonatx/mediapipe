@@ -100,7 +100,7 @@ struct PoseLandmarkerOutputs {
   Source<std::vector<NormalizedLandmarkList>> landmark_lists;
   Source<std::vector<LandmarkList>> world_landmark_lists;
   Source<std::vector<NormalizedLandmarkList>> auxiliary_landmark_lists;
-  Source<std::vector<NormalizedRect>> pose_rects_next_frame;
+  std::optional<Source<std::vector<NormalizedRect>>> pose_rects_next_frame;
   Source<std::vector<Detection>> pose_detections;
   std::optional<Source<std::vector<Image>>> segmentation_masks;
   std::optional<Source<Image>> image;
@@ -373,8 +373,10 @@ class PoseLandmarkerGraph : public core::ModelTaskGraph {
     outs.auxiliary_landmark_lists >>
         graph[Output<std::vector<NormalizedLandmarkList>>(
             kAuxiliaryLandmarksTag)];
-    outs.pose_rects_next_frame >>
-        graph[Output<std::vector<NormalizedRect>>(kPoseRectsNextFrameTag)];
+    if (outs.pose_rects_next_frame) {
+      *outs.pose_rects_next_frame >>
+          graph[Output<std::vector<NormalizedRect>>(kPoseRectsNextFrameTag)];
+    }
     outs.pose_detections >>
         graph[Output<std::vector<Detection>>(kDetectionsTag)];
     if (outs.image) {
@@ -476,9 +478,11 @@ class PoseLandmarkerGraph : public core::ModelTaskGraph {
     auto aux_landmarks =
         pose_landmarks_detector_graph.Out(kAuxiliaryLandmarksTag)
             .Cast<std::vector<NormalizedLandmarkList>>();
-    auto pose_rects_for_next_frame =
-        pose_landmarks_detector_graph.Out(kPoseRectsNextFrameTag)
-            .Cast<std::vector<NormalizedRect>>();
+    std::optional<Source<std::vector<NormalizedRect>>> pose_rects_for_next_frame;
+    if (!stateless) {
+      pose_rects_for_next_frame = pose_landmarks_detector_graph.Out(kPoseRectsNextFrameTag)
+          .Cast<std::vector<NormalizedRect>>();
+    }
     std::optional<Source<std::vector<Image>>> segmentation_masks;
     if (output_segmentation_masks) {
       segmentation_masks =
@@ -557,7 +561,7 @@ class PoseLandmarkerGraph : public core::ModelTaskGraph {
       auto pose_rects = pose_association.Out("");
       pose_rects >> clip_pose_rects.In("");
       // Back edge.
-      pose_rects_for_next_frame >> previous_loopback.In(kLoopTag);
+      *pose_rects_for_next_frame >> previous_loopback.In(kLoopTag);
     } else {
       if (external_pose_rect_in || use_external_pose_rect_in ||
           external_source_projection_rect_in ||

@@ -300,8 +300,13 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
       imageOutStreamIndex = outputStreams.size();
       outputStreams.add("IMAGE:image_out");
     }
-    final int poseRectsNextFrameOutStreamIndex = outputStreams.size();
-    outputStreams.add("POSE_RECTS_NEXT_FRAME:pose_rects_next_frame");
+    final int poseRectsNextFrameOutStreamIndex;
+    if (landmarkerOptions.statelessTracking().orElse(false)) {
+      poseRectsNextFrameOutStreamIndex = OMITTED_OUT_STREAM_INDEX;
+    } else {
+      poseRectsNextFrameOutStreamIndex = outputStreams.size();
+      outputStreams.add("POSE_RECTS_NEXT_FRAME:pose_rects_next_frame");
+    }
     final int poseDetectionsOutStreamIndex = outputStreams.size();
     outputStreams.add("DETECTIONS:pose_detections");
     final int segmentationMasksOutStreamIndex;
@@ -332,7 +337,8 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
                       packets.get(LANDMARKS_OUT_STREAM_INDEX),
                       packets.get(WORLD_LANDMARKS_OUT_STREAM_INDEX),
                       packets.get(auxiliaryLandmarksOutStreamIndex),
-                      packets.get(poseRectsNextFrameOutStreamIndex),
+                      poseRectsNextFrameOutStreamIndex == OMITTED_OUT_STREAM_INDEX
+                          ? null : packets.get(poseRectsNextFrameOutStreamIndex),
                       !packets.get(poseDetectionsOutStreamIndex).isEmpty(),
                       flat);
                   if (flat[FlatPoseResult.VERSION_INDEX] != FlatPoseResult.LAYOUT_VERSION) {
@@ -376,7 +382,8 @@ public final class PoseLandmarker extends BaseVisionTaskApi {
                     packets.get(LANDMARKS_OUT_STREAM_INDEX), NormalizedLandmarkList.parser()),
                 PacketGetter.getProtoVector(
                     packets.get(WORLD_LANDMARKS_OUT_STREAM_INDEX), LandmarkList.parser()),
-                packets.get(poseRectsNextFrameOutStreamIndex).isEmpty()
+                poseRectsNextFrameOutStreamIndex == OMITTED_OUT_STREAM_INDEX
+                    || packets.get(poseRectsNextFrameOutStreamIndex).isEmpty()
                     ? new ArrayList<>()
                     : PacketGetter.getProtoVector(
                         packets.get(poseRectsNextFrameOutStreamIndex),
